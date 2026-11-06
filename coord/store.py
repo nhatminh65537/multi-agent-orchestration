@@ -1,8 +1,8 @@
-"""SQLite state for the Worker Manager (`coord.db`, Protocol v0.4).
+"""SQLite state for the Worker Manager (`coord.db`, Protocol v0.5).
 
 Lives in `COORD_HOME` (default `~/.local/share/coord/coord.db`) so one server on
 a machine can serve every project. Project-local artefacts (`.coord/logs/`,
-`.coord/STATE.md`, `deps.jsonl`) stay in the repo.
+`.coord/STATE.md`) stay in the repo.
 
 Schema notes:
 

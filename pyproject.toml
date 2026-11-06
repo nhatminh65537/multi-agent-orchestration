@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Backend mặc định: Gemini / Vertex / OpenAI-compatible qua Antigravity runtime.
+# Backend mặc định: Gemini / Vertex qua Antigravity runtime.
 agy = ["google-antigravity>=0.1.23,<0.2"]
 # Tuỳ chọn: full Claude Code harness (Read/Edit/Write/Bash/Glob/Grep,
 # project skills, project MCP, can_use_tool policy hook, resume).
@@ -36,3 +36,9 @@ packages = ["coord"]
 [tool.uv]
 # Pin the interpreter used for the server; the system python3 may be PyPy.
 python-preference = "managed"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

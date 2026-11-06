@@ -264,9 +264,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     app = build_app(manager, host=args.host, port=args.port)
     key = (
         os.environ.get("COORD_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
     )
     print(
         f"coord {__version__} (protocol v{PROTOCOL_VERSION})\n"

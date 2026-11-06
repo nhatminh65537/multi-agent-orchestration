@@ -9,4 +9,4 @@ Chỉ **integrator** ghi file này. Mỗi stream một dòng.
 | stream-C | C | — | idle | — | |
 
 Trạng thái hợp lệ: `active` / `waiting` / `idle` / `blocked`.
-Một dòng `dependency` (tuỳ chọn) ghi các task đang mở, khớp với `.coord/deps.jsonl`.
+Integrator tự theo dõi các task đang chờ nhau (ghi vào cột `note`).

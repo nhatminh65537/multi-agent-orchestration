@@ -5,7 +5,7 @@ implement the same `WorkerSession` contract:
 
 * ``agy-sdk``  — ``google-antigravity`` (**mặc định**). ``BuiltinTools``,
   ``skills_paths``, ``policies`` (workspace + shell guards), ``conversation_id``
-  resume. Chạy Gemini / Vertex / endpoint OpenAI-compatible.
+  resume. Chạy Gemini / Vertex.
 * ``claude-sdk`` — ``claude-agent-sdk`` (tuỳ chọn). Claude Code harness, project
   skills, project MCP servers, ``can_use_tool`` policy hook, ``resume``.
 
