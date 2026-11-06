@@ -27,6 +27,7 @@ class TaskPacket(BaseModel):
     files: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     needs_approval: list[str] = Field(default_factory=list)
+    read_only: bool = False
     max_rounds: int = 3
 
     @field_validator("id")
@@ -35,6 +36,14 @@ class TaskPacket(BaseModel):
         if not TASK_ID_RE.match(value):
             raise ValueError(f"task id phải có dạng <stream>-<n>, nhận được {value!r}")
         return value
+
+    @property
+    def is_read_only(self) -> bool:
+        """`read_only: true`, or a `read-only` constraint spelled by hand."""
+        if self.read_only:
+            return True
+        return any("read-only" in item.lower() or "read only" in item.lower()
+                   for item in self.constraints)
 
 
 class WorkerReport(BaseModel):

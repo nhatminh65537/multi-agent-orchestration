@@ -15,7 +15,8 @@ from typing import Any
 import httpx
 
 from . import PROTOCOL_VERSION, __version__
-from .backend import TEMPLATES
+from . import deps as ledger
+from .backend import TEMPLATES, backend_status, default_backend
 from .manager import DEFAULT_HOST, DEFAULT_PORT, build_app, build_manager, coord_home
 
 BEGIN = "<!-- coord:begin -->"
@@ -242,15 +243,22 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    manager = build_manager(model=args.model)
+    manager = build_manager(model=args.model, backend=args.backend)
     app = build_app(manager, host=args.host, port=args.port)
+    key = (
+        os.environ.get("COORD_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
     print(
         f"coord {__version__} (protocol v{PROTOCOL_VERSION})\n"
         f"  mcp:      http://{args.host}:{args.port}/mcp\n"
         f"  events:   http://{args.host}:{args.port}/events/<owner>\n"
+        f"  backend:  {manager.backend}\n"
         f"  model:    {manager.model}\n"
         f"  state:    {coord_home() / 'coord.db'}\n"
-        f"  backend:  {'có API key' if os.environ.get('COORD_API_KEY') or os.environ.get('OPENAI_API_KEY') else 'CHƯA có COORD_API_KEY'}"
+        f"  api key:  {'đã đặt' if key else 'CHƯA đặt COORD_API_KEY'}"
     )
     try:
         app.run(transport="streamable-http")
@@ -289,7 +297,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not rows:
         print("(không có worker)")
         return 0
-    header = ("worker", "owner", "state", "task", "parent", "asks")
+    header = ("worker", "owner", "state", "task", "parent", "backend", "asks")
     table = [
         (
             r["worker_id"],
@@ -297,6 +305,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             r["state"],
             r["task_id"] or "-",
             r["parent"] or "-",
+            r.get("backend") or "-",
             ",".join(r["pending_questions"]) or "-",
         )
         for r in rows
@@ -317,14 +326,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("git", shutil.which("git") is not None, shutil.which("git") or "không thấy")
     check("uv", shutil.which("uv") is not None, shutil.which("uv") or "không thấy", warn=True)
 
-    key = os.environ.get("COORD_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    check("api key", bool(key), "đã đặt" if key else "đặt COORD_API_KEY (hoặc OPENAI_API_KEY)")
+    key = (
+        os.environ.get("COORD_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    backend = (os.environ.get("COORD_BACKEND") or default_backend()).lower()
+    check("backend", True, backend)
+    for status in backend_status():
+        check(
+            f"sdk:{status.name}",
+            status.available,
+            status.detail,
+            warn=status.name == "openai-loop",
+        )
+    check("api key", bool(key), "đã đặt" if key else "đặt COORD_API_KEY (hoặc ANTHROPIC_API_KEY / GEMINI_API_KEY)")
     check(
         "base url",
         True,
-        os.environ.get("COORD_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "mặc định (Gemini OpenAI-compatible)",
+        os.environ.get("COORD_BASE_URL")
+        or os.environ.get("ANTHROPIC_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or "mặc định của backend",
     )
-    check("model", True, os.environ.get("COORD_MODEL") or "gemini-3.8-flash")
+    check("model", True, os.environ.get("COORD_MODEL") or "mặc định của backend")
     check("coord home", True, str(coord_home()))
 
     try:
@@ -351,6 +377,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if any(r[1] == "FAIL" for r in rows) else 0
 
 
+def cmd_deps(args: argparse.Namespace) -> int:
+    """Dependency ledger: `coord deps wait|resolve|open|state|coord` (Protocol §4.1)."""
+    try:
+        repo = git_repo_root(Path(args.repo).resolve())
+    except RuntimeError as exc:
+        print(f"không phải git repo: {exc}")
+        return 1
+
+    if args.action == "wait":
+        ok, message = ledger.add_wait(repo, args.waiter, args.provider, args.task)
+        print(message)
+        return 0 if ok else 1
+    if args.action == "resolve":
+        ok, message = ledger.add_resolve(repo, args.task, args.sha, args.branch, args.waiter)
+        print(message)
+        return 0 if ok else 1
+    if args.action == "open":
+        print(ledger.format_open(repo, args.for_owner))
+        return 0
+    if args.action == "state":
+        print(ledger.state_text(repo))
+        return 0
+    if args.action == "coord":
+        from .paths import coord_dir
+
+        print(f"coord={coord_dir(repo)}\nrepo={repo}")
+        return 0
+    print(f"hành động không hỗ trợ: {args.action}")
+    return 2
+
+
 # --------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -364,6 +421,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     serve.add_argument("--model", default=None)
+    serve.add_argument(
+        "--backend",
+        default=None,
+        choices=["claude-sdk", "agy-sdk", "openai-loop"],
+        help="backend của worker (mặc định: $COORD_BACKEND hoặc claude-sdk)",
+    )
 
     watch = sub.add_parser("watch", help="in event của một owner ra stdout (nguồn cho Monitor)")
     watch.add_argument("--to", required=True, help="tên orchestrator, ví dụ A")
@@ -392,6 +455,27 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--host", default=DEFAULT_HOST)
     doctor.add_argument("--port", type=int, default=DEFAULT_PORT)
 
+    deps = sub.add_parser("deps", help="dependency ledger + cycle detection")
+    deps.add_argument("--repo", default=".", help="repo đích (mặc định: thư mục hiện tại)")
+    deps_sub = deps.add_subparsers(dest="action", required=True)
+
+    wait = deps_sub.add_parser("wait", help="ghi một dependency; exit 1 nếu tạo chu trình")
+    wait.add_argument("waiter")
+    wait.add_argument("provider")
+    wait.add_argument("task")
+
+    resolve = deps_sub.add_parser("resolve", help="đánh dấu dependency đã xong")
+    resolve.add_argument("task")
+    resolve.add_argument("sha")
+    resolve.add_argument("branch")
+    resolve.add_argument("--waiter", default=None)
+
+    open_cmd = deps_sub.add_parser("open", help="liệt kê dependency đang mở")
+    open_cmd.add_argument("--for", dest="for_owner", default=None)
+
+    deps_sub.add_parser("state", help="in .coord/STATE.md")
+    deps_sub.add_parser("coord", help="in đường dẫn .coord/ và repo root")
+
     return parser
 
 
@@ -401,6 +485,7 @@ COMMANDS = {
     "watch": cmd_watch,
     "status": cmd_status,
     "doctor": cmd_doctor,
+    "deps": cmd_deps,
 }
 
 

@@ -19,7 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from coord.backend import WorkerSession, default_model, make_client
+from coord.backend import OpenAILoopSession as WorkerSession, default_model, make_client
 from coord.models import WorkerReport
 
 RESULTS: list[tuple[str, str, str]] = []
