@@ -1,0 +1,16 @@
+{
+  "name": "coord",
+  "owner": {
+    "name": "Kitsu-kun"
+  },
+  "metadata": {
+    "description": "Peer-group orchestration for Claude Code: N sessions, one shared Worker Manager, Gemini workers."
+  },
+  "plugins": [
+    {
+      "name": "coord",
+      "source": "./",
+      "description": "Worker Manager MCP + skills + /coord:* commands."
+    }
+  ]
+}

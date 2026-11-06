@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coord"
+version = "0.1.0"
+description = "Worker Manager MCP server + Claude Code plugin for peer-group agent orchestration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  # mcp 2.x renames FastMCP -> MCPServer; the protocol doc and runbook target 1.x.
+  "mcp>=1.2.0,<2",
+  "httpx>=0.27.0",
+  "pydantic>=2.6.0",
+  "openai>=1.50.0",
+]
+
+[project.scripts]
+coord = "coord.cli:main"
+
+[project.urls]
+Homepage = "https://notes.home.rougitsune.top/doc/multi-agent-orchestration-8QH6VOye9y"
+
+[tool.hatch.build.targets.wheel]
+packages = ["coord"]
+
+[tool.uv]
+# Pin the interpreter used for the server; the system python3 may be PyPy.
+python-preference = "managed"
