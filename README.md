@@ -136,8 +136,12 @@ systemctl --user enable --now coord
 uv sync
 uv run python -m unittest discover -s tests -v
 uv run python verify/p0.py          # needs an API key; SKIPs otherwise
-uv run python -m coord.cli serve    # or: uv run coord serve
+uv run coord serve                  # then, in another shell:
+uv run python verify/mcp_smoke.py   # 6 tools over streamable-http (V-11)
 ```
+
+`mcp` is pinned `<2` on purpose: 2.x renamed `FastMCP` to `MCPServer`, while the protocol doc and
+runbook target the 1.x API.
 
 Layout: `coord/` (package), `skills/` + `commands/` + `.claude-plugin/` (plugin),
 `coord/templates/` (copied into projects), `tests/`, `verify/`.
