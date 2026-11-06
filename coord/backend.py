@@ -31,8 +31,10 @@ from .models import TaskPacket, WorkerReport
 from .paths import TEMPLATES, coord_dir, coord_home, env, git  # noqa: F401 (re-export)
 from .policy import check_tool_policy, extract_command, extract_paths
 
+DEFAULT_THINKING = "medium"
+
 DEFAULT_MODELS = {
-    "agy-sdk": "gemini-3.8-flash",
+    "agy-sdk": "gemini-3.8-flash-medium",
     "claude-sdk": "claude-sonnet-4-5",
 }
 DEFAULT_BACKENDS = ("agy-sdk", "claude-sdk")
@@ -58,10 +60,18 @@ def default_backend() -> str:
 
 def default_model(backend: str | None = None) -> str:
     kind = (backend or default_backend()).lower()
-    return (
-        env("WORKER_MODEL", "COORD_MODEL", default=DEFAULT_MODELS.get(kind, "gemini-3.8-flash"))
+    model = (
+        env(
+            "WORKER_MODEL",
+            "COORD_MODEL",
+            default=DEFAULT_MODELS.get(kind, "gemini-3.8-flash-medium"),
+        )
         or ""
     )
+    thinking = env("WORKER_THINKING", "COORD_THINKING", default=DEFAULT_THINKING)
+    if kind == "agy-sdk" and thinking and model == "gemini-3.8-flash":
+        return f"{model}-{thinking}"
+    return model
 
 
 # ------------------------------------------------------------- system prompt
@@ -281,9 +291,11 @@ class ClaudeSDKWorkerSession(WorkerSession):
         server = create_sdk_mcp_server(
             name="coord_worker", version="0.5.0", tools=self._tool_functions()
         )
+        thinking_effort = env("WORKER_THINKING", "COORD_THINKING", default=DEFAULT_THINKING)
         return ClaudeAgentOptions(
             cwd=str(self.worktree),
             model=self.model,
+            effort=thinking_effort,  # type: ignore[arg-type]
             env=environment,
             system_prompt={
                 "type": "preset",

@@ -88,6 +88,7 @@ def merge_settings(path: Path) -> str:
 
     before = json.dumps(data, sort_keys=True)
     data.setdefault("crossSessionInbound", "accept")
+    data.setdefault("effort", "medium")
     permissions = data.setdefault("permissions", {})
     allow = permissions.setdefault("allow", [])
     for item in ALLOWED_TOOLS:
