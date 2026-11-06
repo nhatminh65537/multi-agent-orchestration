@@ -433,6 +433,47 @@ class ManagerTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_antigravity_session_config_missing_key(self) -> None:
+        from coord.backend import AntigravityWorkerSession, BackendUnavailable
+
+        session = AntigravityWorkerSession(
+            worker_id="w-test",
+            owner="A",
+            worktree=self.wt,
+            model="gemini-3.8-flash-high",
+            packet=TaskPacket.model_validate_json(_packet("A-01")),
+            ask=mock.AsyncMock(),
+            on_report=mock.AsyncMock(),
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(BackendUnavailable):
+                session._config()
+
+    def test_antigravity_session_config_with_base_url(self) -> None:
+        from coord.backend import AntigravityWorkerSession
+
+        session = AntigravityWorkerSession(
+            worker_id="w-test",
+            owner="A",
+            worktree=self.wt,
+            model="gemini-3.8-flash-high",
+            packet=TaskPacket.model_validate_json(_packet("A-01")),
+            ask=mock.AsyncMock(),
+            on_report=mock.AsyncMock(),
+        )
+        env_vars = {
+            "WORKER_API_KEY": "test-key-123",
+            "WORKER_BASE_URL": "https://llm.example.com/v1",
+        }
+        with mock.patch.dict(os.environ, env_vars, clear=True):
+            cfg = session._config()
+            self.assertIsNotNone(cfg.models)
+            self.assertEqual(len(cfg.models), 2)
+            self.assertEqual(cfg.models[0].name, "gemini-3.8-flash-high")
+            self.assertEqual(cfg.models[0].endpoint.base_url, "https://llm.example.com")
+            self.assertEqual(cfg.models[0].endpoint.api_key, "test-key-123")
+            self.assertEqual(cfg.models[1].endpoint.base_url, "https://llm.example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

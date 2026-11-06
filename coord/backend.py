@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import abc
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -404,12 +405,29 @@ class AntigravityWorkerSession(WorkerSession):
 
         base = env("WORKER_BASE_URL", "COORD_BASE_URL", "GEMINI_BASE_URL")
         harness_env: dict[str, str] = {}
+        models = None
         if base:
-            harness_env["GEMINI_BASE_URL"] = base
-            harness_env["GOOGLE_GENAI_BASE_URL"] = base
-            harness_env["BASE_URL"] = base
-            os.environ.setdefault("GEMINI_BASE_URL", base)
-            os.environ.setdefault("GOOGLE_GENAI_BASE_URL", base)
+            from google.antigravity import types
+
+            # Gemini SDK / localharness tự động append /v1beta/..., chuẩn hoá bỏ trailing /v1 hoặc /
+            norm_base = base.rstrip("/")
+            if norm_base.endswith("/v1"):
+                norm_base = norm_base[:-3].rstrip("/")
+            elif norm_base.endswith("/v1beta"):
+                norm_base = norm_base[:-7].rstrip("/")
+
+            harness_env["GEMINI_BASE_URL"] = norm_base
+            harness_env["GOOGLE_GENAI_BASE_URL"] = norm_base
+            harness_env["BASE_URL"] = norm_base
+            os.environ.setdefault("GEMINI_BASE_URL", norm_base)
+            os.environ.setdefault("GOOGLE_GENAI_BASE_URL", norm_base)
+
+            model_name = self.model or default_model("agy-sdk")
+            endpoint = types.GeminiAPIEndpoint(base_url=norm_base, api_key=key)
+            models = [
+                types.ModelTarget(name=model_name, types=[types.ModelType.TEXT], endpoint=endpoint),
+                types.ModelTarget(name=model_name, types=[types.ModelType.IMAGE], endpoint=endpoint),
+            ]
 
         session_id = self.sdk_session_id or uuid.uuid4().hex
         self.sdk_session_id = session_id
@@ -428,8 +446,7 @@ class AntigravityWorkerSession(WorkerSession):
         saves = coord_home() / "conversations"
         saves.mkdir(parents=True, exist_ok=True)
 
-        return LocalAgentConfig(
-            model=self.model,
+        config_kwargs: dict[str, Any] = dict(
             system_instructions=self.system_prompt(),
             tools=[self._tool_ask, self._tool_report],
             policies=self._policies(),
@@ -443,6 +460,12 @@ class AntigravityWorkerSession(WorkerSession):
             api_key=key,
             env=harness_env or None,
         )
+        if models:
+            config_kwargs["models"] = models
+        else:
+            config_kwargs["model"] = self.model
+
+        return LocalAgentConfig(**config_kwargs)
 
     # ------------------------------------------------------------- tools
     async def _tool_ask(self, task_id: str, question: str) -> str:
