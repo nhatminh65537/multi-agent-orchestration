@@ -1,4 +1,4 @@
-"""`coord` command line: serve | up | down | watch | init | doctor | status."""
+"""`coord` command line: serve | up | down | msg | init | doctor | status."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ ALLOWED_TOOLS = [
     "mcp__coord__send",
     "mcp__coord__answer",
     "mcp__coord__status",
+    "mcp__coord__message_session",
     "Bash(coord:*)",
     "Bash(git diff:*)",
     "Bash(git worktree:*)",
@@ -270,7 +271,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(
         f"coord {__version__} (protocol v{PROTOCOL_VERSION})\n"
         f"  mcp:      http://{args.host}:{args.port}/mcp\n"
-        f"  events:   http://{args.host}:{args.port}/events/<owner>\n"
         f"  backend:  {manager.backend}\n"
         f"  model:    {manager.model}\n"
         f"  state:    {coord_home() / 'coord.db'}\n"
@@ -283,20 +283,37 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_watch(args: argparse.Namespace) -> int:
-    url = f"{server_url(args.host, args.port)}/events/{args.to}"
-    print(f"# watch {args.to} → {url} (Ctrl-C để dừng)", flush=True)
-    while True:
-        try:
-            with httpx.stream("GET", url, timeout=None) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line:
-                        print(line, flush=True)
-        except KeyboardInterrupt:
+def cmd_msg(args: argparse.Namespace) -> int:
+    from .ipc import load_records, send_session_message
+
+    if args.list:
+        records = sorted(load_records(), key=lambda x: x.get("pid", 0))
+        if not records:
+            print("(không tìm thấy session Claude Code nào)")
             return 0
-        except Exception:  # noqa: BLE001 - manager restarting / not up yet
-            time.sleep(3)
+        print("%-7s %-32s %-10s %s" % ("PID", "NAME", "STATUS", "SOCKET"))
+        for r in records:
+            print(
+                "%-7s %-32s %-10s %s"
+                % (
+                    r.get("pid", "?"),
+                    r.get("name", "?"),
+                    r.get("status", "?"),
+                    r.get("messagingSocketPath", "-"),
+                )
+            )
+        return 0
+
+    if not args.target or not args.text:
+        print("lỗi: cần truyền target và text (hoặc --list)", file=sys.stderr)
+        return 2
+
+    ok, detail = send_session_message(args.target, args.text)
+    if ok:
+        print(f"đã gửi tới {args.target}")
+        return 0
+    print(f"không gửi được: {detail}", file=sys.stderr)
+    return 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -403,7 +420,6 @@ def cmd_up(args: argparse.Namespace) -> int:
     if _health(args.host, args.port):
         print(f"coord đã chạy: {url}")
         print(f"  mcp:    {url}/mcp")
-        print(f"  events: {url}/events/<owner>")
         return 0
 
     home = coord_home()
@@ -436,7 +452,6 @@ def cmd_up(args: argparse.Namespace) -> int:
         if _health(args.host, args.port):
             print(f"coord đã lên: {url}  (pid {proc.pid})")
             print(f"  mcp:    {url}/mcp")
-            print(f"  events: {url}/events/<owner>")
             print(f"  log:    {log_path}")
             return 0
         if proc.poll() is not None:
@@ -512,10 +527,10 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument("--host", default=DEFAULT_HOST)
     down.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    watch = sub.add_parser("watch", help="in event của một owner ra stdout (nguồn cho Monitor)")
-    watch.add_argument("--to", required=True, help="tên orchestrator, ví dụ A")
-    watch.add_argument("--host", default=DEFAULT_HOST)
-    watch.add_argument("--port", type=int, default=DEFAULT_PORT)
+    msg = sub.add_parser("msg", help="gửi tin nhắn trực tiếp vào một session Claude Code qua IPC socket")
+    msg.add_argument("target", nargs="?", help="tên session, session id, PID, hoặc socket path")
+    msg.add_argument("text", nargs="?", help="nội dung tin nhắn")
+    msg.add_argument("-l", "--list", action="store_true", help="liệt kê các session Claude Code đang chạy")
 
     init = sub.add_parser("init", help="tạo worktree + .coord/ + template trong repo")
     init.add_argument("names", nargs="*", help="tên orchestrator (mặc định: A B C)")
@@ -547,7 +562,7 @@ COMMANDS = {
     "serve": cmd_serve,
     "up": cmd_up,
     "down": cmd_down,
-    "watch": cmd_watch,
+    "msg": cmd_msg,
     "status": cmd_status,
     "doctor": cmd_doctor,
 }

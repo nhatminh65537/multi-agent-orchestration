@@ -26,13 +26,8 @@ Do this at session start, after `/compact`, or after the Worker Manager restarts
 3. Read `.coord/STATE.md` (the integrator owns it) — your row, plus `waiting` / `blocked` rows.
 4. Call `status(owner="<you>")`. Note `RUNNING` / `IDLE` workers, the `backend`, and
    `pending_questions`. An `IDLE` worker is still resumable after a manager restart.
-5. Make sure a persistent Monitor runs:
-
-   ```
-   coord watch --to <you>
-   ```
-
-   Every `ASK` / `DONE` / `FAILED` line wakes you. It reconnects by itself.
+5. Worker Manager tự động đẩy tin nhắn đánh thức session qua Claude Code native IPC khi worker
+   gửi câu hỏi (`ASK`) hoặc kết thúc task (`DONE`/`FAILED`). Bạn không cần chạy lệnh monitor.
 6. Answer pending questions first (section C), then resume the stream's current task.
 7. If a worker is `FAILED` because "Worker Manager restarted", resend the packet — that is not a
    code failure.

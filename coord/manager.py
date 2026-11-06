@@ -21,11 +21,11 @@ import contextlib
 import json
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from .backend import (
     BackendUnavailable,
@@ -34,6 +34,7 @@ from .backend import (
     default_backend,
     default_model,
 )
+from .ipc import async_send_session_message
 from .models import TaskPacket, WorkerReport, validate_owner
 from .paths import coord_dir, coord_home, project_root  # noqa: F401 (re-export)
 from .policy import describe_policy
@@ -67,7 +68,6 @@ class Manager:
 
         self.sessions: dict[str, WorkerSession] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
-        self.subscribers: dict[str, set[asyncio.Queue[str]]] = {}
         self.pending: dict[str, asyncio.Future[str]] = {}
 
         if restore:
@@ -88,28 +88,27 @@ class Manager:
                 )
 
     # ------------------------------------------------------------------ events
-    def emit(self, owner: str, line: str) -> None:
-        """Lưu và fan-out một event (ADR-017)."""
-        subs = self.subscribers.get(owner) or set()
-        self.store.add_event(owner, line, delivered=bool(subs))
-        for queue in list(subs):
-            queue.put_nowait(line)
+    def emit(self, owner: str, line: str, push_message: str | None = None) -> None:
+        """Lưu event vào store và đẩy thẳng vào Claude Code session (ADR-021)."""
+        self.store.add_event(owner, line, delivered=True)
+        self._notify_session(owner, push_message or line)
 
-    async def stream(self, owner: str) -> AsyncIterator[str]:
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        self.subscribers.setdefault(owner, set()).add(queue)
+    def _notify_session(self, owner: str, text: str) -> None:
+        """Đẩy event trực tiếp vào session Claude Code tương ứng qua IPC (ADR-021)."""
+        if not owner or owner == "?":
+            return
+
+        async def _dispatch() -> None:
+            try:
+                await async_send_session_message(owner, text)
+            except Exception:
+                pass
+
         try:
-            backlog = self.store.undelivered_events(owner)
-            if backlog:
-                self.store.mark_delivered([item["id"] for item in backlog])
-                for item in backlog:
-                    yield item["line"]
-            while True:
-                yield await queue.get()
-        finally:
-            subs = self.subscribers.get(owner)
-            if subs is not None:
-                subs.discard(queue)
+            loop = asyncio.get_running_loop()
+            loop.create_task(_dispatch())
+        except RuntimeError:
+            pass
 
     # ----------------------------------------------------------------- workers
     def _require(self, worker_id: str, owner: str) -> dict[str, Any]:
@@ -223,7 +222,12 @@ class Manager:
         self.pending[qid] = future
         self.store.add_question(qid, worker_id, task_id, question)
         self.store.set_state(worker_id, "WAITING_ANSWER")
-        self.emit(owner, f"[{worker_id}] ASK q-{qid} {task_id}: {question[:120]}")
+        line = f"[{worker_id}] ASK q-{qid} {task_id}: {question[:120]}"
+        prompt = (
+            f"[{worker_id}] ASK q-{qid} {task_id}: {question}\n\n"
+            f"Trả lời bằng tool: `mcp__coord__answer(owner=\"{owner}\", question_id=\"{qid}\", text=\"...\")`"
+        )
+        self.emit(owner, line, push_message=prompt)
         try:
             return await asyncio.wait_for(future, timeout=self.ask_timeout)
         except asyncio.TimeoutError:
@@ -247,9 +251,12 @@ class Manager:
         if session is not None:
             self._persist(worker_id, session)
         if report.status == "DONE":
-            self.emit(owner, f"[{worker_id}] DONE {report.id}: {report.summary[:200]} log={log_path}")
+            line = f"[{worker_id}] DONE {report.id}: {report.summary[:200]} log={log_path}"
+            push = f"[{worker_id}] DONE {report.id}: {report.summary}\nlog={log_path}"
+            self.emit(owner, line, push_message=push)
         else:
-            self.emit(owner, f"[{worker_id}] FAILED {report.id}: {report.summary[:200]}")
+            line = f"[{worker_id}] FAILED {report.id}: {report.summary[:200]}"
+            self.emit(owner, line)
 
     def _write_log(
         self,
@@ -430,15 +437,13 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
         """Stop a worker. Orchestrators must have the owner's approval before calling this."""
         return await manager.kill(owner, worker_id)
 
-    @mcp.custom_route("/events/{owner}", methods=["GET"])
-    async def events(request: Request):  # noqa: ANN202 - starlette Response
-        owner = request.path_params["owner"]
-
-        async def generate():  # noqa: ANN202
-            async for line in manager.stream(owner):
-                yield line + "\n"
-
-        return StreamingResponse(generate(), media_type="text/plain")
+    @mcp.tool()
+    async def message_session(target: str, text: str) -> str:
+        """Send a message directly into a peer Claude Code session by name, PID, or session ID."""
+        ok, err = await async_send_session_message(target, text)
+        if ok:
+            return f"sent to {target}"
+        return f"failed: {err}"
 
     @mcp.custom_route("/api/status", methods=["GET"])
     async def api_status(request: Request) -> JSONResponse:

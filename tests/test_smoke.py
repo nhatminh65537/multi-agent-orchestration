@@ -386,29 +386,15 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.store.worker(wid)["state"], "IDLE")
         self.assertEqual(len(self.store.reports(wid)), 2)
 
-    def test_events_fanout_and_replay(self) -> None:
+    def test_events_recorded(self) -> None:
         manager = Manager(
             self.store, backend="agy-sdk", model="fake", restore=False,
             session_factory=fake_factory(),
         )
-
-        async def scenario() -> None:
-            manager.emit("A", "offline-event")
-            self.assertEqual(
-                [e["line"] for e in self.store.undelivered_events("A")], ["offline-event"]
-            )
-
-            first = asyncio.create_task(manager.stream("A").__anext__())
-            second = asyncio.create_task(manager.stream("A").__anext__())
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            self.assertEqual(len(manager.subscribers["A"]), 2)
-            manager.emit("A", "live-event")
-
-            results = await asyncio.gather(first, second)
-            self.assertEqual(sorted(results), ["live-event", "offline-event"])
-
-        asyncio.run(scenario())
+        manager.emit("A", "event-1")
+        manager.emit("A", "event-2")
+        rows = self.store.db.execute("select line from events where owner='A' order by id").fetchall()
+        self.assertEqual([r[0] for r in rows], ["event-1", "event-2"])
 
     def test_kill_while_waiting_does_not_resurrect(self) -> None:
         manager = self._manager()
