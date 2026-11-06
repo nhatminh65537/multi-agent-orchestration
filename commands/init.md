@@ -13,6 +13,4 @@ Sau khi chạy:
    skipped / FAILED).
 2. Nếu bootstrap commit `FAILED` (thiếu `user.name`/`user.email`), nhắc người dùng cấu hình git rồi
    chạy lại; nói rõ worktree hiện chỉ có bản copy, không versioned.
-3. Nếu repo chưa có `.agents/skills/repo-conventions/SKILL.md`, nhắc copy template từ plugin
-   (`skills/repo-conventions/SKILL.md`) và sửa cho đúng repo.
-4. Nhắc bước tiếp theo: `coord serve`, mở N session ở `wt-<name>`, `/rename <name>`.
+3. Nhắc bước tiếp theo: `coord up`, mở N session ở `wt-<name>`, `/rename <name>`.

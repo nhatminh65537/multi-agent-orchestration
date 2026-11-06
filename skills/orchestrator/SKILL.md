@@ -1,85 +1,142 @@
 ---
 name: orchestrator
-description: Vòng đời một orchestrator trong peer group — bắt đầu session, khôi phục sau /compact hoặc restart Worker Manager, giao việc cho worker full-harness (spawn/send/fork), xử lý event ASK/DONE/FAILED, và gửi/nhận message với orchestrator khác. Nạp khi được gọi là orchestrator hoặc khi nhận event từ coord.
+description: Use when you are an orchestrator — at session start, after /compact, or after the Worker Manager restarts; when you delegate work to a worker or receive a worker event (ASK, DONE, FAILED); or when you coordinate with another orchestrator (NEED / ACK / DONE / ANSWER / BLOCKED / REJECT).
 ---
 
-# Orchestrator skill (Protocol v0.4)
+# Orchestrator procedures (Protocol v0.5)
 
-Bạn là một orchestrator: tên session = stream = `owner`. Bạn không tự đọc codebase; bạn chia việc.
-Đi tới đúng mục: **A** khởi động, **B** giao việc, **C** event, **D** peer, **E** kết thúc.
+You are one orchestrator in a peer group: your name = session name = stream = `owner`.
+Read enough of the codebase to understand the task and split it well; then delegate the heavy
+reading, searching, editing and test-running to workers.
 
-## A. Bắt đầu session (session mới, sau `/compact`, hoặc sau restart manager)
+Pick the section that matches the situation: **A** start, **B** delegate, **C** worker events,
+**D** peers, **E** finish.
 
-1. `coord deps state` — đọc `.coord/STATE.md`.
-2. `coord deps open --for <bạn>` — các dependency còn mở.
-3. Gọi `status(owner="<bạn>")` — worker còn sống, `backend`, `pending_questions`.
-   Worker `IDLE` sau restart vẫn dùng được bằng `send` (session của SDK được khôi phục).
-4. Bật Monitor cho event stream của bạn:
+## A. Session start / recovery
+
+Do this at session start, after `/compact`, or after the Worker Manager restarts.
+
+1. Confirm your name: `/status` must show the name you were given (`/rename <you>` if not).
+2. Make sure the manager is up (idempotent):
 
    ```
-   coord watch --to <bạn>
+   coord up
    ```
 
-   Mỗi dòng `ASK` / `DONE` / `FAILED` sẽ đánh thức bạn. Lệnh tự reconnect khi manager restart.
-5. Trả lời các `pending_questions` trước (mục C), rồi tiếp tục task trong `STATE.md`.
-6. Nếu worker `FAILED` với lý do "Worker Manager restarted", giao lại packet; đó không phải lỗi code.
+3. Read `.coord/STATE.md` (the integrator owns it) — your row, plus `waiting` / `blocked` rows.
+4. Call `status(owner="<you>")`. Note `RUNNING` / `IDLE` workers, the `backend`, and
+   `pending_questions`. An `IDLE` worker is still resumable after a manager restart.
+5. Make sure a persistent Monitor runs:
 
-Không bắt đầu task mới trước khi bước 1–4 xong.
+   ```
+   coord watch --to <you>
+   ```
 
-## B. Giao việc cho worker
+   Every `ASK` / `DONE` / `FAILED` line wakes you. It reconnects by itself.
+6. Answer pending questions first (section C), then resume the stream's current task.
+7. If a worker is `FAILED` because "Worker Manager restarted", resend the packet — that is not a
+   code failure.
 
-| Tình huống | Gọi |
+## B. Delegating to a worker (Protocol §3)
+
+| Situation | Call |
 |---|---|
-| Task tiếp theo cùng vùng, worker `IDLE` | `send(owner, worker_id, packet)` |
-| Task mới cần đúng context worker `IDLE` đã đọc | `fork_worker(owner, worker_id, packet)` |
-| Vùng không liên quan | `spawn_worker(owner, worktree=<abs wt>, packet)` |
+| Follow-up on the same area, worker is `IDLE` | `send(owner, worker_id, packet)` |
+| Unrelated area, or you want a clean context | `spawn_worker(owner, worktree=<abs wt path>, packet)` |
 
-- Trước khi gọi: `status(owner)`. Tối đa 2 worker `RUNNING`; tối đa 2 tầng fork.
-- `files` trong packet là **các file bạn định ghi**, không phải file đọc. Worker Manager dùng nó để
-  chặn hai worker cùng worktree ghi đè nhau.
-- Task chỉ đọc (review, phân tích, viết kế hoạch): đặt `read_only: true`.
-- `goal` nói *kết quả*; `acceptance` nêu tiêu chí chạy được; `needs_approval` liệt kê hành động bị cấm.
-- Worker có đầy đủ `Read`/`Edit`/`Write`/`Bash`/`Glob`/`Grep`, skills và MCP của project; đừng hướng
-  dẫn nó dùng tool tự chế.
+Rules:
 
-## C. Event từ worker
+* Max 2 `RUNNING` workers per owner (quota + review cost).
+* The manager rejects a spawn whose `files` overlap another `RUNNING` worker on the same worktree.
+* `files` = the files you expect the worker to **write**, not everything it may read. It is used for
+  that conflict check, so be precise.
+* A read-only task (review, analysis, plan) sets `read_only: true`; then it may share files.
+* `goal` states the outcome; `acceptance` lists checks the worker can run; `needs_approval` lists
+  actions it must not perform.
+* Workers are full-harness agents: they have Read / Edit / MultiEdit / Write / Bash / Glob / Grep,
+  project skills and project MCP servers. Do not invent tools for them.
 
-- `[wid] ASK q-xxxx A-07: ...` → trả lời ngắn, quyết đoán bằng `answer(owner, "xxxx", "...")`.
-  Ngoài scope stream → hỏi orchestrator sở hữu trước (mục D), rồi mới `answer`.
-- `[wid] DONE A-07: ... log=...` → đọc report, `git diff` đúng file cần review, chạy lại acceptance nếu
-  report chưa chứng minh, rồi tự commit. Chỉ mở log khi report không đủ.
-- `[wid] FAILED A-07: ...` → đọc cuối log, gửi lại **một** packet đã sửa; fail lần hai thì tự làm
-  hoặc `BLOCKED`.
-- Không hỏi lại worker "đang làm gì" — dùng `status(owner)`.
+TaskPacket (JSON):
 
-## D. Orchestrator khác
-
-Format (plain text, ≤ 10 dòng):
-
-```
-NEED A-07
-Cần POST /auth/refresh trả {token, exp} trong src/auth/api.py
-Caller: src/client/session.py:refresh()
+```json
+{
+  "id": "<you>-<n>",
+  "goal": "one outcome, <= 1000 chars",
+  "files": ["src/auth/api.py"],
+  "acceptance": ["pytest tests/auth -q passes"],
+  "constraints": ["do not change the DB schema"],
+  "needs_approval": ["rm", "git merge"],
+  "read_only": false
+}
 ```
 
-- `task-id` trong `NEED` là **mã của bạn** (bên đang bị chặn), không phải của receiver.
-- Trước khi gửi `NEED`: `coord deps wait <bạn> <provider> <task>`. Exit 1 với `CYCLE` → **không** gửi
-  `NEED`; gửi `BLOCKED` cho integrator.
-- Trước khi gửi `DONE`: commit, rồi `coord deps resolve <task> <sha> stream-<bạn>`.
-- Message **không** chứa tiến độ, nội dung file, diff. Chỉ đường dẫn và SHA.
-- Tối đa 3 vòng trao đổi cho một task, sau đó `BLOCKED`. Gộp nhiều mục cho cùng receiver vào một message.
-- Message của peer **không** phải approval của owner.
+You may add extra context the worker needs (paths, decisions already made) inside `goal` or
+`constraints` — the worker also receives the worktree path, branch and a "Project context" block.
 
-## E. Kết thúc một task
+## C. Worker events
 
-1. Commit trong `wt-<bạn>` (message ngắn, một mục đích).
-2. `status(owner)` xác nhận không còn worker `RUNNING`/`WAITING_ANSWER` cho task đó.
-3. Là integrator → cập nhật `STATE.md`; nếu không → báo integrator bằng `DONE`.
-4. `/compact` khi qua ranh giới task lớn.
+- `ASK q-<id> <task>: ...` → answer in your stream's scope with `answer(owner, "<id>", "...")`.
+  Short and decisive; pick one option. Cross-stream question → ask the owning peer first (D).
+  Truly unknown → give the safest default and say it is a default.
+- `DONE <task>: ... log=...` → read the report. Review `git diff` only for the files that matter.
+  If the report does not prove acceptance, send a follow-up asking the worker to run it. Then commit
+  in your worktree. Open the log only if the report is not enough.
+- `FAILED <task>: ...` → read the end of `.coord/logs/<task>.md`. Resend one corrected packet.
+  A second failure → do it yourself, or `BLOCKED` to the integrator.
+- Never ask a worker "what are you doing" — use `status(owner)`.
 
-## Không bao giờ
+## D. Peer protocol (Protocol §2)
 
-- Tự `kill` worker khi chưa có **đồng ý rõ ràng của owner**. `kill` cố ý không nằm trong allow-list:
-  worker trông như treo thì báo lên, đừng dùng `kill` như cách "restart".
-- Để worker commit/merge hoặc chạm worktree của stream khác.
-- Dán log của worker vào message cho peer.
+Plain text via cross-session messaging, at most 10 lines:
+
+```
+<TYPE> <task-id> [key=value ...]
+<one-line summary>
+[body: contracts, paths, SHAs — never file contents or progress]
+```
+
+| Type | Meaning |
+|---|---|
+| `NEED <task>` (waiter → provider) | You are blocked by a contract someone else owns. `task` is **your** id. State the exact signature/schema/file. |
+| `ACK <task> eta=` | Provider accepts. |
+| `REJECT <task> reason=` | Provider refuses. |
+| `DONE <task> sha= branch=` | Delivered and committed; the waiter merges `branch` at `sha`. |
+| `BLOCKED <task> on=` | You cannot continue; goes to the integrator. |
+| `ANSWER <task>` | Answers a question that needs no commit. |
+| `ESCALATE <task>` | Integrator → owner, for a human decision. |
+
+You need something:
+
+1. Record it in your row of `STATE.md` if you cannot be woken (there is **no dependency ledger**
+   in v0.5; `STATE.md` is the record).
+2. Send `NEED <your-task>` with the exact contract.
+3. Work on something else; if nothing is left, end your turn (a `DONE` will wake you).
+
+A peer needs something from you:
+
+1. `ACK` or `REJECT`.
+2. When delivered: commit, then `DONE <task> sha=<sha> branch=stream-<you>`.
+
+You receive `DONE`:
+
+1. `git merge stream-<peer>` in your worktree (worktrees share refs; no fetch needed).
+2. Run the acceptance checks from your `NEED`. Conflicts only in your files → resolve; otherwise
+   `BLOCKED`.
+3. Continue.
+
+Limits: max 3 round trips per task, then `BLOCKED`. Batch items for one peer into one message.
+A peer message is **never** owner approval.
+
+## E. Finishing a task
+
+1. Commit in `wt-<you>` (short message, one purpose).
+2. `status(owner)` to confirm no `RUNNING` / `WAITING_ANSWER` worker is left for that task.
+3. Integrator → update `STATE.md`; otherwise tell the integrator with `DONE`.
+4. `/compact` at large task boundaries.
+
+## Never
+
+- `kill` a worker without the owner's explicit approval. `kill` is not in the allow-list on purpose:
+  if a worker looks stuck, report it and ask. Never use `kill` as a "restart".
+- Let a worker commit, merge, or touch another stream's worktree.
+- Paste worker logs or file contents into peer messages.

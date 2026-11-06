@@ -1,8 +1,7 @@
 """Policy hook (V-9) — one implementation shared by every backend driver.
 
 The hook is deliberately a pure function so it can be unit-tested without any
-SDK, and so `claude-sdk`, `agy-sdk` and the legacy `openai-loop` driver all
-enforce exactly the same rules.
+SDK, and so both `claude-sdk` and `agy-sdk` enforce exactly the same rules.
 
 Rules (Protocol v0.4 §3.3.1):
 

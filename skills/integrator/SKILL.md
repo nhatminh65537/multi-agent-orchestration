@@ -1,49 +1,48 @@
 ---
 name: integrator
-description: Vai trò integrator — sở hữu .coord/STATE.md, phá chu trình phụ thuộc trong deps.jsonl, quyết định thứ tự merge giữa các stream và escalate lên owner khi cần. Nạp khi STATE.md ghi bạn là integrator.
+description: Use only if STATE.md names you as integrator — when updating .coord/STATE.md, deciding merge order between stream branches, resolving BLOCKED messages, or escalating a decision to the owner.
 ---
 
-# Integrator skill
+# Integrator
 
-Bạn vẫn là một orchestrator; thêm ba trách nhiệm dưới đây.
+You are still an orchestrator; these are your additional duties.
 
-## 1. `STATE.md` là của bạn
+## 1. Start
 
-- Mỗi stream một dòng: `stream | owner | current task | status | last sha | note`.
-- `status` ∈ `active / waiting / idle / blocked`. Cập nhật khi: task bắt đầu, task xong, nhận
-  `BLOCKED`, hoặc trước khi kết thúc phiên làm việc.
-- Không ai khác ghi file này; nếu peer sửa, khôi phục từ git và nhắc peer.
-
-## 2. Phá chu trình phụ thuộc
-
-```bash
-# các task còn open = có "wait" mà chưa có "resolve"
-python3 - <<'PY'
-import json, pathlib
-opened, closed = set(), set()
-for line in pathlib.Path(".coord/deps.jsonl").read_text().splitlines():
-    if not line.strip():
-        continue
-    r = json.loads(line)
-    (opened.add(r["task"]) if r["op"] == "wait" else closed.add(r["task"]))
-print("open:", sorted(opened - closed))
-PY
+```
+coord up
 ```
 
-- Vẽ cạnh `waiter → provider`; nếu có chu trình, chọn cạnh "rẻ" nhất để cắt (thường là chỗ có thể
-  tự quyết bằng một giả định), rồi gửi `BLOCKED` hoặc `ANSWER` cho hai bên.
-- Không tự sửa code của stream khác để "cho xong".
+Then read `.coord/STATE.md` and `status()` (all owners). Write down the merge order you intend.
 
-## 3. Thứ tự merge
+## 2. STATE.md is yours alone
 
-- Nguyên tắc: merge cái **mở khoá** nhiều stream nhất trước (contract/interface), rồi mới tới phần
-  dùng nó.
-- Trước khi merge: `git diff main...stream-<X>`, kiểm tra test liên quan, xác nhận `files` không
-  chồng với stream đang merge.
-- Sau merge: cập nhật `STATE.md`, gửi `DONE` kèm `sha=` `branch=` cho các bên đang chờ.
-- Xung đột lặp lại ở cùng file = file ownership sai → phân lại trong `STATE.md`.
+One row per stream:
 
-## 4. Escalate
+```
+stream | owner | current task | status (active/waiting/idle/blocked) | last sha | note
+```
 
-Gửi `ESCALATE` (một message hiện trong session của bạn) khi: cần owner quyết định phạm vi, hai stream
-tranh chấp contract, hoặc quota/chi phí vượt ngưỡng. Nêu rõ 2 lựa chọn + đề xuất.
+Keep it under ~40 lines. Update it when a task starts, when it finishes, when you receive `BLOCKED`,
+and before you end a work session. Nobody else writes this file; if a peer edits it, restore it from
+git and remind them. There is no dependency ledger in v0.5 — blocked/waiting rows here are the record.
+
+## 3. Breaking a deadlock
+
+- Read the `BLOCKED` messages and the `waiting` rows.
+- Pick the cheapest edge to cut: usually the one where a reasonable assumption unblocks both sides.
+- Tell both peers with `ANSWER` (or redirect one with `NEED`), then record the decision in `STATE.md`.
+- Never edit another stream's code "to make it work".
+
+## 4. Merge order
+
+- Merge what **unblocks the most streams** first (contracts/interfaces), then the code that uses it.
+- Before merging: `git diff main...stream-<X>`, run the relevant tests (delegate to a worker),
+  confirm `files` did not collide with a stream that is running.
+- After merging: update `STATE.md` (`last sha`), send `DONE sha= branch=` to anyone waiting.
+- The same file conflicting repeatedly = wrong file ownership → reassign it in `STATE.md`.
+
+## 5. Escalate
+
+Send `ESCALATE` (a message that shows up in your session) when a scope decision, a contract dispute
+between two streams, or quota/cost needs the owner. State the options and your recommendation.

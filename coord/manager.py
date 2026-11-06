@@ -1,17 +1,17 @@
 """Worker Manager: MCP tools, owner checks, durable event stream.
 
-One process serves the whole machine. Tools take a `worktree` (absolute path),
-so a single server can manage workers for several projects; `coord.db` lives in
-`COORD_HOME`, logs live in each project's `.coord/logs/`.
+Một tiến trình phục vụ toàn máy. Tool nhận `worktree` (đường dẫn tuyệt đối) nên
+một server quản được nhiều project; `coord.db` nằm trong `COORD_HOME`, log nằm ở
+`.coord/logs/` của từng project.
 
-Protocol v0.4 behaviour implemented here:
+Hành vi Protocol v0.5:
 
-* backend selection + session resume/restore (V-8, V-13);
-* durable, fan-out event stream with replay (ADR-017);
-* restore-on-startup (BUG-04);
-* overlap check for `files` (ADR-019);
-* the Manager, not the worker, writes `.coord/logs/<task>.md` (ADR-016);
-* `kill` cannot be undone by the `finally` of `ask_orchestrator` (BUG-06a).
+* chọn backend + khôi phục session (V-8);
+* event bền vững, fan-out, replay (ADR-017);
+* dọn trạng thái khi khởi động lại (BUG-04);
+* chặn xung đột `files` trên cùng worktree (ADR-019);
+* **Manager** ghi `.coord/logs/<task>.md`, worker không ghi (ADR-016);
+* `kill` không bị `finally` của `ask_orchestrator` ghi đè (BUG-06a).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import contextlib
 import json
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -40,9 +40,11 @@ from .policy import describe_policy
 from .store import Store
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+DEFAULT_PORT = 30303
 
 RESTART_ANSWER = "SERVER_RESTARTED"
+
+SessionFactory = Callable[..., WorkerSession]
 
 
 class Manager:
@@ -53,16 +55,15 @@ class Manager:
         backend: str | None = None,
         model: str | None = None,
         ask_timeout: int = 1800,
-        max_fork_depth: int = 2,
         restore: bool = True,
-        client_factory: Any = None,
+        session_factory: SessionFactory | None = None,
     ) -> None:
         self.store = store
         self.backend = (backend or default_backend()).lower()
         self.model = model or default_model(self.backend)
         self.ask_timeout = ask_timeout
-        self.max_fork_depth = max_fork_depth
-        self.client_factory = client_factory
+        # Chỉ dùng cho test; production để None và dùng build_session.
+        self.session_factory = session_factory
 
         self.sessions: dict[str, WorkerSession] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
@@ -74,7 +75,7 @@ class Manager:
 
     # ------------------------------------------------------------------ restore
     def restore(self) -> None:
-        """Reconcile the database with an empty in-memory state (V-8, BUG-04)."""
+        """Đồng bộ DB với RAM rỗng (V-8, BUG-04)."""
         for question in self.store.pending_question_rows():
             self.store.answer_question(question["id"], RESTART_ANSWER)
         for row in self.store.states():
@@ -88,7 +89,7 @@ class Manager:
 
     # ------------------------------------------------------------------ events
     def emit(self, owner: str, line: str) -> None:
-        """Persist and fan out one event (ADR-017)."""
+        """Lưu và fan-out một event (ADR-017)."""
         subs = self.subscribers.get(owner) or set()
         self.store.add_event(owner, line, delivered=bool(subs))
         for queue in list(subs):
@@ -119,15 +120,8 @@ class Manager:
             raise ValueError(f"{worker_id} thuộc owner {row['owner']!r}, không phải {owner!r}")
         return row
 
-    def _depth(self, worker_id: str) -> int:
-        depth, cursor = 0, worker_id
-        while (row := self.store.worker(cursor)) and row["parent"]:
-            depth += 1
-            cursor = row["parent"]
-        return depth
-
     def _assert_no_overlap(self, worktree: Path, packet: TaskPacket) -> None:
-        """ADR-019 / R-13: two writers on one worktree must not touch the same file."""
+        """ADR-019 / R-13: hai worker ghi trên cùng worktree không được trùng file."""
         if packet.is_read_only or not packet.files:
             return
         mine = {str(item).strip() for item in packet.files if str(item).strip()}
@@ -153,10 +147,9 @@ class Manager:
         packet: TaskPacket | None,
         *,
         session_id: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        restore: bool = False,
     ) -> WorkerSession:
-        return build_session(
+        factory = self.session_factory or build_session
+        return factory(
             self.backend,
             worker_id=worker_id,
             owner=owner,
@@ -166,21 +159,17 @@ class Manager:
             ask=lambda task_id, question: self._ask(worker_id, owner, task_id, question),
             on_report=lambda report: self._record_report(worker_id, report),
             session_id=session_id,
-            messages=messages,
-            restore=restore,
-            client=self.client_factory() if self.client_factory else None,
         )
 
     def _session_for(self, worker_id: str) -> WorkerSession:
-        """Get the live session, or rebuild it from the database (V-8)."""
+        """Lấy session đang sống, hoặc dựng lại từ DB (V-8)."""
         session = self.sessions.get(worker_id)
         if session is not None:
             return session
         row = self.store.worker(worker_id)
         if row is None:
             raise ValueError(f"worker không tồn tại: {worker_id}")
-        messages = self.store.messages(worker_id)
-        if not row.get("session_id") and messages is None:
+        if not row.get("session_id"):
             raise ValueError(
                 f"không còn conversation cho {worker_id}; dùng spawn_worker cho task mới"
             )
@@ -190,8 +179,6 @@ class Manager:
             Path(row["worktree"]),
             None,
             session_id=row.get("session_id"),
-            messages=messages,
-            restore=True,
         )
         self.sessions[worker_id] = session
         return session
@@ -214,15 +201,12 @@ class Manager:
             self.store.set_state(worker_id, "FAILED")
             self.emit(owner, f"[{worker_id}] FAILED {session.task_id or '-'}: {str(exc)[:200]}")
             self._write_log(session, None, error=str(exc))
-        except Exception as exc:  # noqa: BLE001 - a broken worker must not kill the manager
+        except Exception as exc:  # noqa: BLE001 - một worker hỏng không được giết manager
             self.store.set_state(worker_id, "FAILED")
             self.emit(owner, f"[{worker_id}] FAILED {session.task_id or '-'}: {str(exc)[:200]}")
             self._write_log(session, None, error=str(exc))
-        else:
-            self._persist(worker_id, session)
         finally:
-            if not session.report:
-                self._persist(worker_id, session)
+            self._persist(worker_id, session)
 
     def _persist(self, worker_id: str, session: WorkerSession) -> None:
         if session.sdk_session_id:
@@ -247,7 +231,7 @@ class Manager:
         finally:
             self.pending.pop(qid, None)
             row = self.store.worker(worker_id)
-            # Do NOT resurrect a worker that was killed while waiting (BUG-06a).
+            # Không "hồi sinh" worker đã bị kill khi đang chờ (BUG-06a).
             if row and row["state"] == "WAITING_ANSWER":
                 self.store.set_state(worker_id, "RUNNING")
 
@@ -273,7 +257,7 @@ class Manager:
         report: WorkerReport | None,
         error: str | None = None,
     ) -> str:
-        """ADR-016: the Manager owns `.coord/logs/<task-id>.md`."""
+        """ADR-016: Manager sở hữu `.coord/logs/<task-id>.md`."""
         logs = coord_dir(session.worktree) / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         task = (report.id if report else session.task_id) or "task"
@@ -323,42 +307,12 @@ class Manager:
             str(project_root(wt)),
             str(wt),
             packet.id,
-            parent=None,
             backend=self.backend,
             files=packet.files,
             read_only=packet.is_read_only,
         )
         self._start(worker_id, task)
         return worker_id
-
-    async def fork_worker(self, owner: str, worker_id: str, task: str) -> str:
-        validate_owner(owner)
-        row = self._require(worker_id, owner)
-        if row["state"] != "IDLE":
-            raise ValueError(f"{worker_id} đang {row['state']}; chỉ fork worker IDLE")
-        if self._depth(worker_id) + 1 > self.max_fork_depth:
-            raise ValueError(f"vượt giới hạn fork {self.max_fork_depth} tầng; dùng spawn_worker")
-        packet = TaskPacket.model_validate_json(task)
-        wt = Path(row["worktree"])
-        self._assert_no_overlap(wt, packet)
-
-        source = self._session_for(worker_id)
-        new_id = f"{owner}-{uuid.uuid4().hex[:4]}"
-        session = source.fork(new_worker_id=new_id, packet=packet)
-        self.sessions[new_id] = session
-        self.store.add_worker(
-            new_id,
-            owner,
-            row["project"],
-            str(wt),
-            packet.id,
-            parent=worker_id,
-            backend=self.backend,
-            files=packet.files,
-            read_only=packet.is_read_only,
-        )
-        self._start(new_id, task)
-        return new_id
 
     async def send(self, owner: str, worker_id: str, text: str) -> str:
         validate_owner(owner)
@@ -433,12 +387,11 @@ class Manager:
                     "project": row["project"],
                     "state": row["state"],
                     "task_id": row["task_id"],
-                    "parent": row["parent"],
                     "worktree": row["worktree"],
                     "backend": row.get("backend"),
                     "session_id": row.get("session_id"),
                     "files": json.loads(row.get("files_json") or "[]"),
-                    # BUG-04: read from SQLite, not from the in-memory futures.
+                    # BUG-04: đọc từ SQLite, không lọc theo future trong RAM.
                     "pending_questions": self.store.pending_questions(row["id"]),
                 }
             )
@@ -458,11 +411,6 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
         return await manager.spawn_worker(owner, worktree, task)
 
     @mcp.tool()
-    async def fork_worker(owner: str, worker_id: str, task: str) -> str:
-        """Clone an IDLE worker's conversation into a new worker on the same worktree."""
-        return await manager.fork_worker(owner, worker_id, task)
-
-    @mcp.tool()
     async def send(owner: str, worker_id: str, text: str) -> str:
         """Send a follow-up message or a new TaskPacket into the same conversation."""
         return await manager.send(owner, worker_id, text)
@@ -474,7 +422,7 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
 
     @mcp.tool()
     async def status(owner: str | None = None, project: str | None = None) -> list[dict[str, Any]]:
-        """List workers: state, parent, backend, current task, pending questions."""
+        """List workers: state, backend, current task, pending questions."""
         return manager.status(owner=owner, project=project)
 
     @mcp.tool()

@@ -3,7 +3,7 @@
 Verifies V-11: one HTTP MCP endpoint, tools listed, `status` callable, and
 protocol errors surface as tool errors instead of crashes.
 
-Run: uv run python verify/mcp_smoke.py [--url http://127.0.0.1:8765/mcp]
+Run: uv run python verify/mcp_smoke.py [--url http://127.0.0.1:30303/mcp]
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from mcp.client.streamable_http import streamablehttp_client
 
 EXPECTED = {
     "spawn_worker",
-    "fork_worker",
     "send",
     "answer",
     "status",
@@ -49,12 +48,12 @@ async def main(url: str) -> int:
             detail = result.content[0].text if result.content else ""
             print(f"spawn_worker lỗi đúng như mong đợi: {detail[:140]}")
 
-    print("PASS V-11 (MCP streamable-http, 6 tool, lỗi protocol trả về client)")
+    print("PASS V-11 (MCP streamable-http, 5 tool, lỗi protocol trả về client)")
     return 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="http://127.0.0.1:8765/mcp")
+    parser.add_argument("--url", default="http://127.0.0.1:30303/mcp")
     args = parser.parse_args()
     raise SystemExit(asyncio.run(main(args.url)))

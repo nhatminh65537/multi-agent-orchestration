@@ -7,8 +7,8 @@ a machine can serve every project. Project-local artefacts (`.coord/logs/`,
 Schema notes:
 
 * `session_id` is the opaque SDK session/conversation id — the basis of V-8/V-13.
-* `messages_json` is only used by the deprecated `openai-loop` driver so that it
-  can also be restored after a restart.
+* `messages_json` is unused by the SDK drivers (they persist `session_id`); it stays
+  for a custom `session_factory` that keeps its own transcript.
 * `files_json` backs the overlap check (ADR-019).
 * `events` makes the event stream durable and replayable (ADR-017).
 """
@@ -30,7 +30,7 @@ create table if not exists workers (
     task_id       text,
     state         text not null,
     parent        text,
-    backend       text not null default 'openai-loop',
+    backend       text not null default 'agy-sdk',
     session_id    text,
     files_json    text not null default '[]',
     messages_json text,
@@ -70,7 +70,7 @@ create index if not exists events_owner_delivered on events(owner, delivered);
 
 # Columns added in v0.4; older databases are migrated in place.
 _ADDED_COLUMNS = {
-    "backend": "text not null default 'openai-loop'",
+    "backend": "text not null default 'agy-sdk'",
     "session_id": "text",
     "files_json": "text not null default '[]'",
     "messages_json": "text",
@@ -111,7 +111,7 @@ class Store:
         parent: str | None = None,
         state: str = "RUNNING",
         *,
-        backend: str = "openai-loop",
+        backend: str = "agy-sdk",
         session_id: str | None = None,
         files: Sequence[str] = (),
         read_only: bool = False,

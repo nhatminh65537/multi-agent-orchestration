@@ -58,7 +58,7 @@ async def main(url: str, clients: int, repo: Path) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="http://127.0.0.1:8765/mcp")
+    parser.add_argument("--url", default="http://127.0.0.1:30303/mcp")
     parser.add_argument("--clients", type=int, default=3)
     parser.add_argument("--repo", default=".")
     args = parser.parse_args()

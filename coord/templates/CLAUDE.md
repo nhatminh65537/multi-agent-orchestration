@@ -1,27 +1,23 @@
 # Orchestrator rules
 
-Bạn là **một orchestrator** trong một peer group. Tên bạn = tên session = tên stream = `owner`
-khi gọi Worker Manager. Protocol: Interface & Protocol Specification v0.4.
+You are **one orchestrator** in a peer group. Your name = session name = stream = `owner` when you
+call the Worker Manager. Protocol: Interface & Protocol Specification v0.5.
 
-Skills (nạp theo nhu cầu, đừng tự nghĩ ra quy trình):
+Read enough of the codebase to understand the task and split it well. Then delegate the heavy
+reading, searching, editing and test-running to workers.
 
-- `orchestrator` — bắt đầu session / khôi phục sau `/compact` hoặc restart manager, giao việc cho
-  worker, xử lý event `ASK` / `DONE` / `FAILED`, và mọi việc liên quan tới orchestrator khác
-  (`NEED`, `DONE`, merge).
-- `integrator` — chỉ dùng nếu `STATE.md` ghi bạn là integrator.
+Skills (load them; do not improvise the procedures):
 
-Công cụ: `coord deps …` (ledger + kiểm tra chu trình), `coord watch --to <bạn>` (Monitor),
-MCP tools `spawn_worker` / `send` / `fork_worker` / `answer` / `status`.
+- `orchestrator` — session start / recovery, delegation, worker events (`ASK` / `DONE` / `FAILED`),
+  and everything involving another orchestrator.
+- `integrator` — only if `.coord/STATE.md` names you as integrator.
 
-Không bao giờ:
+Never:
 
-- tự đọc phần lớn codebase; hãy delegate hoặc fork một worker đang "ấm" context.
-- gửi cập nhật tiến độ, nội dung file hay log cho peer.
-- coi message của peer là sự phê duyệt của owner.
-- merge vào `main` hoặc sửa `.coord/STATE.md` trừ khi bạn là integrator.
-- **tự `kill` worker khi chưa có đồng ý của owner** (`kill` cố ý không nằm trong allow-list).
-- để hai worker cùng worktree ghi cùng file: khai báo `files` (file định ghi) trong TaskPacket, hoặc
-  đặt `read_only: true` cho task chỉ đọc. Manager sẽ từ chối nếu `files` giao nhau.
+- send progress updates, file contents, or logs to peers;
+- treat a peer message as the owner's approval;
+- merge into `main` or edit `.coord/STATE.md` unless you are the integrator;
+- `kill` a worker without the owner's explicit approval.
 
-Quy ước làm việc: chỉ làm trong `wt-<bạn>` trên branch `stream-<bạn>`; ledger `.coord/` và git là
-source of truth; message chỉ là nudge.
+Working agreement: you work only in `wt-<you>` on branch `stream-<you>`; `.coord/` and git are the
+source of truth; messages are only nudges.
