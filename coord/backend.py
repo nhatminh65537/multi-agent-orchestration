@@ -53,12 +53,15 @@ class BackendUnavailable(RuntimeError):
 
 # --------------------------------------------------------------------- config
 def default_backend() -> str:
-    return (env("COORD_BACKEND", default="agy-sdk") or "agy-sdk").lower()
+    return (env("WORKER_BACKEND", "COORD_BACKEND", default="agy-sdk") or "agy-sdk").lower()
 
 
 def default_model(backend: str | None = None) -> str:
     kind = (backend or default_backend()).lower()
-    return env("COORD_MODEL", default=DEFAULT_MODELS.get(kind, "gemini-3.8-flash")) or ""
+    return (
+        env("WORKER_MODEL", "COORD_MODEL", default=DEFAULT_MODELS.get(kind, "gemini-3.8-flash"))
+        or ""
+    )
 
 
 # ------------------------------------------------------------- system prompt
@@ -255,12 +258,12 @@ class ClaudeSDKWorkerSession(WorkerSession):
     def _options(self):  # noqa: ANN202
         from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
 
-        key = env("COORD_API_KEY", "ANTHROPIC_API_KEY")
-        base = env("COORD_BASE_URL", "ANTHROPIC_BASE_URL")
+        key = env("WORKER_API_KEY", "COORD_API_KEY", "ANTHROPIC_API_KEY")
+        base = env("WORKER_BASE_URL", "COORD_BASE_URL", "ANTHROPIC_BASE_URL")
         if not key:
             raise BackendUnavailable(
-                "Backend `claude-sdk` cần COORD_API_KEY (hoặc ANTHROPIC_API_KEY). "
-                "Đặt biến này cho `coord serve`, hoặc dùng backend mặc định agy-sdk."
+                "Backend `claude-sdk` cần WORKER_API_KEY hoặc COORD_API_KEY (hoặc ANTHROPIC_API_KEY). "
+                "Đặt biến này trong file config/env hoặc shell."
             )
 
         environment = {"ANTHROPIC_API_KEY": key}
@@ -380,12 +383,21 @@ class AntigravityWorkerSession(WorkerSession):
     def _config(self):  # noqa: ANN202
         from google.antigravity import LocalAgentConfig
 
-        key = env("COORD_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+        key = env("WORKER_API_KEY", "COORD_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
         if not key:
             raise BackendUnavailable(
-                "Backend `agy-sdk` cần COORD_API_KEY hoặc GEMINI_API_KEY. "
-                "Đặt biến này cho `coord serve` (hoặc dùng `coord up` với EnvironmentFile)."
+                "Backend `agy-sdk` cần WORKER_API_KEY hoặc COORD_API_KEY (hoặc GEMINI_API_KEY). "
+                "Đặt biến này trong file config/env hoặc shell."
             )
+
+        base = env("WORKER_BASE_URL", "COORD_BASE_URL", "GEMINI_BASE_URL")
+        harness_env: dict[str, str] = {}
+        if base:
+            harness_env["GEMINI_BASE_URL"] = base
+            harness_env["GOOGLE_GENAI_BASE_URL"] = base
+            harness_env["BASE_URL"] = base
+            os.environ.setdefault("GEMINI_BASE_URL", base)
+            os.environ.setdefault("GOOGLE_GENAI_BASE_URL", base)
 
         session_id = self.sdk_session_id or uuid.uuid4().hex
         self.sdk_session_id = session_id
@@ -417,6 +429,7 @@ class AntigravityWorkerSession(WorkerSession):
             save_dir=str(saves),
             app_data_dir=str(saves),
             api_key=key,
+            env=harness_env or None,
         )
 
     # ------------------------------------------------------------- tools

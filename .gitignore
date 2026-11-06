@@ -7,3 +7,4 @@ dist/
 .coord/
 wt-*/
 docs/
+.env

@@ -19,6 +19,7 @@ import httpx
 from . import PROTOCOL_VERSION, __version__
 from .backend import TEMPLATES, backend_status, default_backend
 from .manager import DEFAULT_HOST, DEFAULT_PORT, build_app, build_manager, coord_home
+from .paths import env
 
 BEGIN = "<!-- coord:begin -->"
 END = "<!-- coord:end -->"
@@ -263,18 +264,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     manager = build_manager(model=args.model, backend=args.backend)
     app = build_app(manager, host=args.host, port=args.port)
-    key = (
-        os.environ.get("COORD_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-    )
+    key = env("WORKER_API_KEY", "COORD_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
     print(
         f"coord {__version__} (protocol v{PROTOCOL_VERSION})\n"
         f"  mcp:      http://{args.host}:{args.port}/mcp\n"
         f"  backend:  {manager.backend}\n"
         f"  model:    {manager.model}\n"
         f"  state:    {coord_home() / 'coord.db'}\n"
-        f"  api key:  {'đã đặt' if key else 'CHƯA đặt COORD_API_KEY'}"
+        f"  api key:  {'đã đặt' if key else 'CHƯA đặt WORKER_API_KEY'}"
     )
     try:
         app.run(transport="streamable-http")
@@ -359,29 +356,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("git", shutil.which("git") is not None, shutil.which("git") or "không thấy")
     check("uv", shutil.which("uv") is not None, shutil.which("uv") or "không thấy", warn=True)
 
-    key = (
-        os.environ.get("COORD_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-    )
-    backend = (os.environ.get("COORD_BACKEND") or default_backend()).lower()
+    key = env("WORKER_API_KEY", "COORD_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
+    backend = (env("WORKER_BACKEND", "COORD_BACKEND", default=default_backend()) or default_backend()).lower()
+    base_url = env("WORKER_BASE_URL", "COORD_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BASE_URL")
+    model = env("WORKER_MODEL", "COORD_MODEL")
     check("backend", True, backend)
     for name, available, detail in backend_status():
         check(f"sdk:{name}", available, detail, warn=name != backend)
     check(
         "api key",
         bool(key),
-        "đã đặt" if key else "đặt COORD_API_KEY (hoặc GEMINI_API_KEY / ANTHROPIC_API_KEY)",
+        "đã đặt" if key else "đặt WORKER_API_KEY (hoặc COORD_API_KEY / GEMINI_API_KEY)",
     )
-    check(
-        "base url",
-        True,
-        os.environ.get("COORD_BASE_URL")
-        or os.environ.get("GEMINI_BASE_URL")
-        or "mặc định của backend",
-    )
-    check("model", True, os.environ.get("COORD_MODEL") or "mặc định của backend")
+    check("base url", True, base_url or "mặc định của backend")
+    check("model", True, model or "mặc định của backend")
     check("coord home", True, str(coord_home()))
+    cfg = getattr(args, "loaded_config", None)
+    if cfg and Path(cfg).is_file():
+        check("config file", True, str(Path(cfg).resolve()))
+    else:
+        check("config file", False, "chưa cấu hình (dùng --config hoặc tạo .env)", warn=True)
 
     try:
         health = httpx.get(f"{server_url(args.host, args.port)}/health", timeout=5)
@@ -441,10 +435,14 @@ def cmd_up(args: argparse.Namespace) -> int:
         cmd += ["--backend", args.backend]
     if args.model:
         cmd += ["--model", args.model]
+    if getattr(args, "config", None):
+        cmd += ["--config", str(Path(args.config).resolve())]
 
     with log_path.open("ab") as log:
         kwargs = {"start_new_session": True} if os.name == "posix" else {}
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        proc = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(), **kwargs
+        )
     pid_path.write_text(str(proc.pid), encoding="utf-8")
 
     deadline = time.monotonic() + 20
@@ -499,14 +497,23 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
+    config_parent = argparse.ArgumentParser(add_help=False)
+    config_parent.add_argument(
+        "--config",
+        "-c",
+        default=argparse.SUPPRESS,
+        help="đường dẫn tới file cấu hình (.env)",
+    )
+
     parser = argparse.ArgumentParser(
         prog="coord",
         description=f"Worker Manager + peer-group orchestration kit (protocol v{PROTOCOL_VERSION}).",
+        parents=[config_parent],
     )
     parser.add_argument("--version", action="version", version=f"coord {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve = sub.add_parser("serve", help="chạy Worker Manager (MCP streamable-http)")
+    serve = sub.add_parser("serve", parents=[config_parent], help="chạy Worker Manager (MCP streamable-http)")
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     serve.add_argument("--model", default=None)
@@ -517,22 +524,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="backend của worker (mặc định: $COORD_BACKEND hoặc agy-sdk)",
     )
 
-    up = sub.add_parser("up", help="chạy Worker Manager ở nền nếu chưa chạy, rồi kiểm tra /health")
+    up = sub.add_parser("up", parents=[config_parent], help="chạy Worker Manager ở nền nếu chưa chạy, rồi kiểm tra /health")
     up.add_argument("--host", default=DEFAULT_HOST)
     up.add_argument("--port", type=int, default=DEFAULT_PORT)
     up.add_argument("--backend", default=None, choices=["agy-sdk", "claude-sdk"])
     up.add_argument("--model", default=None)
 
-    down = sub.add_parser("down", help="dừng Worker Manager đã do `coord up` khởi động")
+    down = sub.add_parser("down", parents=[config_parent], help="dừng Worker Manager đã do `coord up` khởi động")
     down.add_argument("--host", default=DEFAULT_HOST)
     down.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    msg = sub.add_parser("msg", help="gửi tin nhắn trực tiếp vào một session Claude Code qua IPC socket")
+    msg = sub.add_parser("msg", parents=[config_parent], help="gửi tin nhắn trực tiếp vào một session Claude Code qua IPC socket")
     msg.add_argument("target", nargs="?", help="tên session, session id, PID, hoặc socket path")
     msg.add_argument("text", nargs="?", help="nội dung tin nhắn")
     msg.add_argument("-l", "--list", action="store_true", help="liệt kê các session Claude Code đang chạy")
 
-    init = sub.add_parser("init", help="tạo worktree + .coord/ + template trong repo")
+    init = sub.add_parser("init", parents=[config_parent], help="tạo worktree + .coord/ + template trong repo")
     init.add_argument("names", nargs="*", help="tên orchestrator (mặc định: A B C)")
     init.add_argument("--repo", default=".", help="repo đích (mặc định: thư mục hiện tại)")
     init.add_argument("--worktree-root", default="..", help="thư mục chứa wt-<name> (mặc định: ..)")
@@ -543,13 +550,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="chỉ ghi file, không commit bootstrap (worktree sẽ thiếu file, có copy bù)",
     )
 
-    status = sub.add_parser("status", help="liệt kê worker từ server đang chạy")
+    status = sub.add_parser("status", parents=[config_parent], help="liệt kê worker từ server đang chạy")
     status.add_argument("--owner", default=None)
     status.add_argument("--project", default=None)
     status.add_argument("--host", default=DEFAULT_HOST)
     status.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    doctor = sub.add_parser("doctor", help="kiểm tra môi trường và server")
+    doctor = sub.add_parser("doctor", parents=[config_parent], help="kiểm tra môi trường và server")
     doctor.add_argument("--repo", default=".")
     doctor.add_argument("--host", default=DEFAULT_HOST)
     doctor.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -570,6 +577,9 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    from .config import load_env_file
+
+    args.loaded_config = load_env_file(getattr(args, "config", None))
     return COMMANDS[args.command](args)
 
 
