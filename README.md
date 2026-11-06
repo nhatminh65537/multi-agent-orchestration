@@ -15,6 +15,7 @@ coord serve         ──►  MCP streamable-http @ 127.0.0.1:8765 (spawn/send/
 Protocol: Interface & Protocol Specification **v0.3**
 ([doc 3](https://notes.home.rougitsune.top/doc/3-interface-protocol-specification-0zspVJmdTj)).
 Design docs: [Multi-Agent Orchestration](https://notes.home.rougitsune.top/doc/multi-agent-orchestration-8QH6VOye9y).
+Hướng dẫn tiếng Việt: **[HUONG-DAN.md](HUONG-DAN.md)**.
 
 ## Install
 
