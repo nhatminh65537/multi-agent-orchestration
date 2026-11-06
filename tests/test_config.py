@@ -47,3 +47,21 @@ EMPTY_VAL=
     def test_missing_explicit_file_raises(self) -> None:
         with self.assertRaises(FileNotFoundError):
             load_env_file(self.dir / "non-existent.env")
+
+    def test_load_worktree_fallback(self) -> None:
+        # Simulate running in a worktree subdirectory with .env at root
+        root_env = self.dir / ".env"
+        root_env.write_text("WORKER_MODEL=test-root-model\n", encoding="utf-8")
+        sub_dir = self.dir / "wt-A"
+        sub_dir.mkdir()
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(sub_dir)
+            with patch("coord.paths.project_root", return_value=self.dir), \
+                 patch.dict(os.environ, {}, clear=True):
+                loaded = load_env_file()
+                self.assertEqual(loaded, root_env)
+                self.assertEqual(os.environ.get("WORKER_MODEL"), "test-root-model")
+        finally:
+            os.chdir(orig_cwd)

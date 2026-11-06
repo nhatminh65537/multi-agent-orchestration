@@ -28,6 +28,16 @@ def load_env_file(path: str | Path | None = None) -> Path | None:
         candidate = Path(".env").resolve()
         if candidate.is_file():
             target = candidate
+        else:
+            # Fallback: kiểm tra .env ở gốc repo cha nếu đang chạy từ worktree hoặc thư mục con
+            try:
+                from .paths import project_root
+
+                root_candidate = (project_root(Path.cwd()) / ".env").resolve()
+                if root_candidate.is_file():
+                    target = root_candidate
+            except Exception:
+                pass
 
     if not target or not target.is_file():
         return None
