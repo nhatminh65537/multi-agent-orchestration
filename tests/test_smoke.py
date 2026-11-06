@@ -6,9 +6,11 @@ Run: uv run python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -118,11 +120,11 @@ class StoreTests(unittest.TestCase):
 
 
 class WorkerLoopTests(unittest.TestCase):
-    def _session(self, tmp: Path, script: list[_Response], reports: list[WorkerReport]):
+    def _session(self, tmp: Path, script: list[_Response], reports: list[WorkerReport], ask=None):
         async def on_report(report: WorkerReport) -> None:
             reports.append(report)
 
-        async def ask(task_id: str, question: str) -> str:
+        async def default_ask(task_id: str, question: str) -> str:
             return "use 42"
 
         return WorkerSession(
@@ -131,7 +133,7 @@ class WorkerLoopTests(unittest.TestCase):
             worktree=tmp,
             model="fake",
             client=_FakeClient(script),  # type: ignore[arg-type]
-            ask=ask,
+            ask=ask or default_ask,
             on_report=on_report,
         )
 
@@ -181,6 +183,32 @@ class WorkerLoopTests(unittest.TestCase):
             asyncio.run(session.run("ask first"))
             tool_messages = [m for m in session.messages if m.get("role") == "tool"]
             self.assertEqual(tool_messages[0]["content"], "use 42")
+
+    def test_blocking_tool_keeps_turn_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            reports: list[WorkerReport] = []
+            script = [
+                _Response(_call(1, "ask_orchestrator", '{"task_id":"A-01","question":"wait"}')),
+                _Response(
+                    _call(
+                        2,
+                        "report_completion",
+                        '{"report":{"id":"A-01","status":"DONE","summary":"continued after block"}}',
+                    )
+                ),
+            ]
+
+            async def slow_ask(task_id: str, question: str) -> str:
+                await asyncio.sleep(1.2)
+                return "go on"
+
+            session = self._session(tmp, script, reports, ask=slow_ask)
+            started = time.monotonic()
+            asyncio.run(session.run("block then report"))
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 1.2)
+            self.assertEqual(len(reports), 1)
 
 
 class ManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -255,12 +283,33 @@ class InitTests(unittest.TestCase):
             self.assertTrue((repo / ".coord" / "STATE.md").is_file())
             self.assertTrue((tmp / "wts" / "wt-A").is_dir())
             self.assertIn("/.coord/", (repo / ".gitignore").read_text())
+
+            # bootstrap commit exists and worktrees inherited it
+            log = subprocess.run(
+                ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True, check=True
+            ).stdout
+            self.assertIn("coord: bootstrap", log)
+            for rel in ("CLAUDE.md", "AGENTS.md", ".claude/settings.json", ".mcp.json"):
+                self.assertTrue((tmp / "wts" / "wt-A" / rel).is_file(), rel)
+
+            settings = json.loads((repo / ".claude" / "settings.json").read_text())
+            self.assertEqual(settings["crossSessionInbound"], "accept")
+            servers = json.loads((repo / ".mcp.json").read_text())["mcpServers"]
+            self.assertEqual(servers["coord"]["url"], cli.MCP_URL)
+
             claude = (repo / "CLAUDE.md").read_text()
             self.assertEqual(claude.count(cli.BEGIN), 1)
 
+            commits_before = len(log.splitlines())
             self.assertEqual(cli.cmd_init(args), 0)
             self.assertEqual((repo / "CLAUDE.md").read_text().count(cli.BEGIN), 1)
             self.assertEqual((repo / ".gitignore").read_text().count("/.coord/"), 1)
+            commits_after = len(
+                subprocess.run(
+                    ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True, check=True
+                ).stdout.splitlines()
+            )
+            self.assertEqual(commits_before, commits_after, "init lần 2 không được commit thêm")
 
 
 if __name__ == "__main__":

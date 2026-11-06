@@ -20,6 +20,7 @@ from .manager import DEFAULT_HOST, DEFAULT_PORT, build_app, build_manager, coord
 
 BEGIN = "<!-- coord:begin -->"
 END = "<!-- coord:end -->"
+MCP_URL = "http://127.0.0.1:8765/mcp"
 
 ALLOWED_TOOLS = [
     "mcp__coord__spawn_worker",
@@ -95,6 +96,35 @@ def merge_settings(path: Path) -> str:
     return "unchanged" if before == json.dumps(data, sort_keys=True) else "updated"
 
 
+def merge_mcp_json(path: Path) -> str:
+    """Register the coord server project-locally (works without the plugin)."""
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            return f"bỏ qua (JSON lỗi: {exc})"
+
+    before = json.dumps(data, sort_keys=True)
+    servers = data.setdefault("mcpServers", {})
+    servers.setdefault("coord", {"type": "http", "url": MCP_URL})
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return "unchanged" if before == json.dumps(data, sort_keys=True) else "updated"
+
+
+def commit_bootstrap(repo: Path, paths: list[Path]) -> str:
+    """Commit only the files `init` touches, so worktrees inherit them."""
+    relatives = [str(p.relative_to(repo)) for p in paths if p.exists()]
+    if not relatives:
+        return "nothing to commit"
+    run(["git", "add", "--", *relatives], cwd=repo)
+    staged = run(["git", "diff", "--cached", "--name-only", "--", *relatives], cwd=repo)
+    if not staged:
+        return "nothing to commit"
+    run(["git", "commit", "-q", "-m", "coord: bootstrap orchestration files", "--", *relatives], cwd=repo)
+    return "committed"
+
+
 def ensure_gitignore(repo: Path) -> str:
     path = repo / ".gitignore"
     text = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -122,39 +152,87 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"repo:      {repo}")
     print(f"worktrees: {root}")
 
-    existing = run(["git", "worktree", "list", "--porcelain"], cwd=repo)
-    for name in names:
-        branch = f"{args.branch_prefix}{name}"
-        path = root / f"wt-{name}"
-        if path.exists():
-            print(f"  = wt-{name} đã tồn tại, bỏ qua")
-            continue
-        has_branch = any(
-            line == f"branch refs/heads/{branch}" for line in existing.splitlines()
-        )
-        cmd = ["git", "worktree", "add", str(path)]
-        cmd += [branch] if has_branch else ["-b", branch]
-        try:
-            run(cmd, cwd=repo)
-            print(f"  + wt-{name} ({branch})")
-        except RuntimeError as exc:
-            print(f"  ! wt-{name}: {exc}")
-
+    # 1. Project files first, so the bootstrap commit can carry them into worktrees.
     coord = repo / ".coord"
     (coord / "logs").mkdir(parents=True, exist_ok=True)
     state = coord / "STATE.md"
     if not state.exists():
         state.write_text(template("STATE.md"), encoding="utf-8")
         print("  + .coord/STATE.md")
-    print(f"  = .gitignore: {ensure_gitignore(repo)}")
 
-    print(f"  = CLAUDE.md: {upsert_block(repo / 'CLAUDE.md', template('CLAUDE.md'))}")
-    print(f"  = AGENTS.md: {upsert_block(repo / 'AGENTS.md', template('AGENTS.md'))}")
-    print(f"  = .claude/settings.json: {merge_settings(repo / '.claude' / 'settings.json')}")
+    written = {
+        "gitignore": repo / ".gitignore",
+        "claude": repo / "CLAUDE.md",
+        "agents": repo / "AGENTS.md",
+        "settings": repo / ".claude" / "settings.json",
+        "mcp": repo / ".mcp.json",
+    }
+    print(f"  = .gitignore: {ensure_gitignore(repo)}")
+    print(f"  = CLAUDE.md: {upsert_block(written['claude'], template('CLAUDE.md'))}")
+    print(f"  = AGENTS.md: {upsert_block(written['agents'], template('AGENTS.md'))}")
+    print(f"  = .claude/settings.json: {merge_settings(written['settings'])}")
+    print(f"  = .mcp.json: {merge_mcp_json(written['mcp'])}")
+
+    # 2. Commit those files (only those) so every worktree gets them.
+    commit_state = "skipped (--no-commit)"
+    if not args.no_commit:
+        try:
+            commit_state = commit_bootstrap(
+                repo,
+                [
+                    written["gitignore"],
+                    written["claude"],
+                    written["agents"],
+                    written["settings"],
+                    written["mcp"],
+                ],
+            )
+        except RuntimeError as exc:
+            commit_state = f"FAILED: {exc}"
+            print(f"  ! bootstrap commit thất bại: {exc}")
+            print("    đặt `git config user.name` / `user.email` rồi chạy lại;")
+            print("    worktree sẽ được tạo nhưng thiếu file bootstrap (sẽ copy bù).")
+    print(f"  = bootstrap commit: {commit_state}")
+
+    # 3. Worktrees, now based on the commit above.
+    for name in names:
+        branch = f"{args.branch_prefix}{name}"
+        path = root / f"wt-{name}"
+        if path.exists():
+            print(f"  = wt-{name} đã tồn tại, bỏ qua")
+            continue
+        has_branch = False
+        try:
+            run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo)
+            has_branch = True
+        except RuntimeError:
+            has_branch = False
+        cmd = ["git", "worktree", "add", "-q", str(path)]
+        cmd += [branch] if has_branch else ["-b", branch]
+        try:
+            run(cmd, cwd=repo)
+            print(f"  + wt-{name} ({branch})")
+        except RuntimeError as exc:
+            print(f"  ! wt-{name}: {exc}")
+            continue
+
+        missing = [
+            rel
+            for rel in ("CLAUDE.md", "AGENTS.md", ".claude/settings.json", ".mcp.json")
+            if not (path / rel).exists()
+        ]
+        if missing:
+            for rel in missing:
+                src = repo / rel
+                if not src.exists():
+                    continue
+                (path / rel).parent.mkdir(parents=True, exist_ok=True)
+                (path / rel).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"    (copy bù vào worktree: {', '.join(missing)})")
 
     print(
         "\nTiếp theo:\n"
-        f"  1. coord serve            # Worker Manager (một lần cho cả máy)\n"
+        "  1. coord serve            # Worker Manager (một lần cho cả máy)\n"
         f"  2. mở {len(names)} session Claude Code tại "
         + ", ".join(f"{root / f'wt-{n}'}" for n in names)
         + "\n  3. trong mỗi session: /rename <tên>, rồi gửi bootstrap prompt\n"
@@ -297,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--repo", default=".", help="repo đích (mặc định: thư mục hiện tại)")
     init.add_argument("--worktree-root", default="..", help="thư mục chứa wt-<name> (mặc định: ..)")
     init.add_argument("--branch-prefix", default="stream-")
+    init.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="chỉ ghi file, không commit bootstrap (worktree sẽ thiếu file, có copy bù)",
+    )
 
     status = sub.add_parser("status", help="liệt kê worker từ server đang chạy")
     status.add_argument("--owner", default=None)
