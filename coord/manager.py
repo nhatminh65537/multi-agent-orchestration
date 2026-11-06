@@ -90,7 +90,7 @@ class Manager:
     # ------------------------------------------------------------------ events
     def emit(self, owner: str, line: str, push_message: str | None = None) -> None:
         """Lưu event vào store và đẩy thẳng vào Claude Code session (ADR-021)."""
-        self.store.add_event(owner, line, delivered=True)
+        self.store.add_event(owner, line)
         self._notify_session(owner, push_message or line)
 
     def _notify_session(self, owner: str, text: str) -> None:

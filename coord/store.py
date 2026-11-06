@@ -19,7 +19,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 SCHEMA = """
 create table if not exists workers (
@@ -59,13 +59,12 @@ create table if not exists events (
     id         integer primary key autoincrement,
     owner      text not null,
     line       text not null,
-    delivered  integer not null default 0,
     created_at text not null
 );
 create index if not exists workers_owner on workers(owner);
 create index if not exists workers_project on workers(project);
 create index if not exists workers_worktree on workers(worktree);
-create index if not exists events_owner_delivered on events(owner, delivered);
+create index if not exists events_owner on events(owner);
 """
 
 # Columns added in v0.4; older databases are migrated in place.
@@ -270,30 +269,31 @@ class Store:
         return [dict(r) for r in rows]
 
     # ----------------------------------------------------------------- events
-    def add_event(self, owner: str, line: str, delivered: bool = False) -> int:
+    def add_event(self, owner: str, line: str, **kwargs: Any) -> int:
         cursor = self.db.execute(
-            "insert into events(owner, line, delivered, created_at) values(?,?,?,?)",
-            (owner, line, int(delivered), now()),
+            "insert into events(owner, line, created_at) values(?,?,?)",
+            (owner, line, now()),
         )
         self.db.commit()
         return int(cursor.lastrowid)
 
-    def undelivered_events(self, owner: str) -> list[dict[str, Any]]:
-        rows = self.db.execute(
-            "select id, line from events where owner=? and delivered=0 order by id", (owner,)
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def mark_delivered(self, ids: Iterable[int]) -> None:
-        ids = list(ids)
-        if not ids:
-            return
-        self.db.executemany("update events set delivered=1 where id=?", [(i,) for i in ids])
-        self.db.commit()
+    def events(self, owner: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """Lấy danh sách audit events gần nhất."""
+        if owner:
+            rows = self.db.execute(
+                "select * from events where owner=? order by id desc limit ?",
+                (owner, limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "select * from events order by id desc limit ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
     def prune_events(self, days: int = 7) -> int:
+        """Dọn dẹp audit events cũ hơn N ngày."""
         cursor = self.db.execute(
-            "delete from events where delivered=1 and created_at < datetime('now', ?)",
+            "delete from events where datetime(created_at) < datetime('now', ?)",
             (f"-{int(days)} day",),
         )
         self.db.commit()

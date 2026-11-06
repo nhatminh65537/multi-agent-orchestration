@@ -188,9 +188,7 @@ async def run_e2e() -> None:
             assert rep["status"] == "DONE"
 
             # Kiểm tra log events
-            events = [e["line"] for e in store.undelivered_events("OrchestratorA")] + [
-                r[0] for r in store.db.execute("select line from events where owner='OrchestratorA'").fetchall()
-            ]
+            events = [e["line"] for e in store.events("OrchestratorA")]
             print(f"  Các sự kiện đã ghi nhận cho OrchestratorA: {len(events)} events")
 
     finally:

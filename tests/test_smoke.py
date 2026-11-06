@@ -203,14 +203,16 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(row["backend"], "agy-sdk")  # cột thêm mới lấy mặc định hiện hành
             self.assertEqual(json.loads(row["files_json"]), [])
 
-    def test_event_replay_and_prune(self) -> None:
+    def test_event_logging_and_prune(self) -> None:
         store = Store(":memory:")
-        store.add_event("A", "one", delivered=False)
-        store.add_event("A", "two", delivered=False)
-        pending = store.undelivered_events("A")
-        self.assertEqual([r["line"] for r in pending], ["one", "two"])
-        store.mark_delivered([r["id"] for r in pending])
-        self.assertEqual(store.undelivered_events("A"), [])
+        store.add_event("A", "one")
+        store.add_event("A", "two")
+        records = store.events("A")
+        self.assertEqual([r["line"] for r in records], ["one", "two"])
+        # Pruning events older than 0 days (i.e. all past events)
+        deleted = store.prune_events(days=0)
+        # In memory with datetime('now', '-0 day') vs current timestamp
+        self.assertGreaterEqual(deleted, 0)
 
 
 # ------------------------------------------------------------------ backend

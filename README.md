@@ -8,7 +8,7 @@ This repo is the *mechanism*, not a project. Install it once, then `coord init` 
 ```
 Claude Code plugin  ──►  /coord:* commands, skills (orchestrator, integrator),
                          MCP registration for `coord`
-coord (Python CLI)  ──►  init | up | down | serve | watch | status | doctor
+coord (Python CLI)  ──►  init | up | down | serve | msg | status | doctor
 coord serve         ──►  MCP streamable-http @ 127.0.0.1:30303
                          spawn_worker · send · answer · status · kill
 ```
@@ -84,7 +84,7 @@ Orchestrator models are chosen in Claude Code — coord never touches them.
 orchestrator A ──spawn_worker(TaskPacket)──► worker (full harness in wt-A)
        ▲                                            │
        │  event DONE / ASK / FAILED  ◄──────────────┘
-       │  (coord watch --to A  → Monitor)
+       │  (Native IPC socket push: wakes A at 0 idle tokens)
        └── answer(qid) ──────────────────────────► unblocks ask_orchestrator
 ```
 
