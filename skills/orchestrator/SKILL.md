@@ -16,7 +16,9 @@ Pick the section that matches the situation: **A** start, **B** delegate, **C** 
 
 Do this at session start, after `/compact`, or after the Worker Manager restarts.
 
-1. Confirm your name: `/status` must show the name you were given (`/rename <you>` if not).
+1. Confirm your name and thinking level:
+   - `/status` must show the name you were given (`/rename <you>` if not).
+   - Set thinking level to **Medium** (default for orchestrators: deep enough to split tasks accurately, fast enough to coordinate).
 2. Make sure the manager is up (idempotent):
 
    ```
