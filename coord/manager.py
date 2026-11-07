@@ -361,6 +361,10 @@ class Manager:
         if session.touched_files:
             lines += ["", "## touched files", ""]
             lines += [f"- `{item}`" for item in sorted(session.touched_files)]
+        denials = getattr(session, "denials", None) or []
+        if denials:
+            lines += ["", "## denied calls", ""]
+            lines += [f"- {item}" for item in denials[-20:]]
 
         path.write_text("\n".join(lines), encoding="utf-8")
         return str(path)

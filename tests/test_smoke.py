@@ -231,7 +231,10 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_read_only_blocks_every_write_tool(self) -> None:
-        for tool in ("Write", "Edit", "MultiEdit", "create_file", "edit_file"):
+        for tool in (
+            "Write", "Edit", "MultiEdit", "create_file", "edit_file",
+            "write_to_file", "replace_file_content",
+        ):
             ok, reason = check_tool_policy(
                 tool, {"file_path": str(self.wt / "a.py"), "path": str(self.wt / "a.py")},
                 self.wt, read_only=True,
@@ -247,6 +250,43 @@ class PolicyTests(unittest.TestCase):
         ok, _ = check_tool_policy("create_file", {"path": str(self.wt / "b.py")}, self.wt)
         self.assertTrue(ok)
         ok, _ = check_tool_policy("run_command", {"CommandLine": "git reset --hard"}, self.wt)
+        self.assertFalse(ok)
+
+    def test_antigravity_harness_path_keys(self) -> None:
+        """agy-sdk tools send PascalCase keys (`TargetFile`), not just `path`."""
+        inside = str(self.wt / "a.py")
+        for key in ("TargetFile", "target_file", "Path", "path", "file_path", "filePath"):
+            ok, reason = check_tool_policy("write_to_file", {key: inside}, self.wt)
+            self.assertTrue(ok, f"{key}: {reason}")
+
+        outside = str(Path(self.tmp.name) / "wt-B" / "a.py")
+        for key in ("TargetFile", "target_file"):
+            ok, reason = check_tool_policy("replace_file_content", {key: outside}, self.wt)
+            self.assertFalse(ok, key)
+            self.assertIn("outside worktree", reason)
+
+    def test_antigravity_read_tools_use_pascal_case_keys(self) -> None:
+        outside = str(Path(self.tmp.name) / "wt-B" / "a.py")
+        payload = {"AbsolutePath": outside, "DirectoryPath": outside, "SearchPath": outside}
+        for tool in ("view_file", "list_dir", "grep_search"):
+            ok, reason = check_tool_policy(tool, payload, self.wt)
+            self.assertFalse(ok, tool)
+            self.assertIn("outside worktree", reason)
+
+    def test_write_without_any_path_is_denied(self) -> None:
+        ok, reason = check_tool_policy("write_to_file", {"CodeContent": "line1"}, self.wt)
+        self.assertFalse(ok)
+        self.assertIn("no path", reason)
+
+    def test_file_uri_is_checked_on_the_real_path(self) -> None:
+        inside = (self.wt / "a.py").as_uri()
+        ok, reason = check_tool_policy("write_to_file", {"TargetFile": inside}, self.wt)
+        self.assertTrue(ok, reason)
+        outside = (Path(self.tmp.name) / "wt-B" / "a.py").as_uri()
+        ok, reason = check_tool_policy("write_to_file", {"TargetFile": outside}, self.wt)
+        self.assertFalse(ok)
+        # An unknown scheme cannot be verified, so it stays denied.
+        ok, _ = check_tool_policy("write_to_file", {"TargetFile": "cns://blob/abc"}, self.wt)
         self.assertFalse(ok)
 
 
@@ -832,6 +872,39 @@ class ManagerTests(unittest.TestCase):
         write_rule = policies["coord-worktree-write"]
         self.assertTrue(write_rule.when({"Path": str(self.wt / "a.py")}))
         self.assertTrue(write_rule.when({}))
+
+    def test_antigravity_policies_understand_harness_arguments(self) -> None:
+        try:
+            from google.antigravity import BuiltinTools  # noqa: F401
+        except Exception:  # noqa: BLE001
+            self.skipTest("google-antigravity is not installed")
+
+        from coord.backend import AntigravityWorkerSession
+
+        session = AntigravityWorkerSession(
+            worker_id="w-test",
+            owner="A",
+            worktree=self.wt,
+            model="gemini-3.8-flash-high",
+            packet=TaskPacket.model_validate_json(_packet("A-01")),
+            ask=mock.AsyncMock(),
+        )
+        rules = {p.name: p for p in session._policies() if getattr(p, "name", None)}
+        write_rule = rules["coord-worktree-write"]
+        inside = str(self.wt / "hook-test.txt")
+        outside = str(self.wt.parent / "elsewhere" / "hook-test.txt")
+
+        # `write_to_file` sends `TargetFile`; the old code only looked for
+        # `path`/`file_path` and therefore denied every write.
+        self.assertFalse(write_rule.when({"TargetFile": inside}))
+        self.assertTrue(write_rule.when({"TargetFile": outside}))
+        # No path at all stays fail-closed.
+        self.assertTrue(write_rule.when({"CodeContent": "line1"}))
+
+        # A successful check counts progress; denials keep their real reason
+        # for the manager log (the model only sees the policy name).
+        self.assertEqual(session.steps, 1)
+        self.assertTrue(any("outside worktree" in line for line in session.denials))
 
 
 

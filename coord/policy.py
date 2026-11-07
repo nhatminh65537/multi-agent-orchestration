@@ -15,20 +15,24 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import unquote, urlparse
 
-# Only the tool names the two real harnesses use: `claude-sdk` (Write/Edit/Read/Bash…)
-# and `agy-sdk` `BuiltinTools` (create_file/edit_file/view_file/run_command…).
+# Only the tool names the two real harnesses use: `claude-sdk` (Write/Edit/Read/Bash…),
+# `agy-sdk` `BuiltinTools` (create_file/edit_file/view_file/run_command…) and the public
+# names the Antigravity harness exposes to the model (write_to_file/replace_file_content…).
 WRITE_TOOLS = frozenset(
     {
         "write", "edit", "multiedit", "notebookedit",  # claude-sdk
-        "create_file", "edit_file",  # agy-sdk
+        "create_file", "edit_file",  # agy-sdk BuiltinTools
+        "write_to_file", "replace_file_content", "multi_replace_file_content",  # agy harness
         "write_file", "delete_file", "move_file", "create_directory",  # MCP-style
     }
 )
 READ_TOOLS = frozenset(
     {
         "read", "grep", "glob", "websearch", "webfetch",  # claude-sdk
-        "view_file", "list_directory", "search_directory",  # agy-sdk
+        "view_file", "list_directory", "search_directory",  # agy-sdk BuiltinTools
+        "list_dir", "grep_search", "find_by_name",  # agy harness
         "find_file", "search_web", "read_url_content",
     }
 )
@@ -41,7 +45,25 @@ FORBIDDEN_GIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_PATH_KEYS = ("file_path", "filePath", "path", "Path", "target_file", "notebook_path", "directory")
+# Harness argument keys are spelled inconsistently: snake_case (`file_path`,
+# `target_file`), camelCase (`filePath`) and PascalCase (`TargetFile`,
+# `AbsolutePath`, `SearchPath`). Every key is compared through `_key()` so all
+# spellings resolve to the same entry — a missing spelling means the path is
+# never seen and a write is denied even inside the worktree.
+PATH_KEYS = frozenset(
+    {
+        "path",
+        "filepath",
+        "targetfile",
+        "absolutepath",
+        "directorypath",
+        "directory",
+        "searchpath",
+        "outputpath",
+        "scriptpath",
+        "notebookpath",
+    }
+)
 _COMMAND_KEYS = ("command", "cmd", "CommandLine", "command_line", "script", "shell")
 
 
@@ -65,22 +87,45 @@ def resolve_target(path: str | Path, worktree: Path) -> Path:
 
 def is_path_inside_worktree(path: str | Path, worktree: Path) -> bool:
     root = Path(worktree).expanduser().resolve()
+    raw = str(path)
+    if "://" in raw:  # a scheme we cannot map to a filesystem path
+        return False
     try:
-        target = resolve_target(path, root)
+        target = resolve_target(raw, root)
     except (OSError, ValueError):
         return False
     return target == root or target.is_relative_to(root)
 
 
+def _as_path(value: str) -> str:
+    """Turn a `file://` wire URI into a plain path (the harness sends both)."""
+    text = value.strip()
+    if text[:5].lower() != "file:":
+        return text
+    parsed = urlparse(text)
+    path = unquote(parsed.path or "")
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        path = f"//{parsed.netloc}{path}"  # UNC share
+    elif re.match(r"^/[A-Za-z]:", path):
+        path = path[1:]  # `/D:/repo` -> `D:/repo`
+    return path or text
+
+
+def _key(name: str) -> str:
+    """Collapse `file_path` / `filePath` / `TargetFile` to one comparable key."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
 def _iter_path_values(tool_input: dict[str, Any]) -> Iterable[str]:
-    for key in _PATH_KEYS:
-        value = tool_input.get(key)
+    for key, value in (tool_input or {}).items():
+        if _key(key) not in PATH_KEYS:
+            continue
         if isinstance(value, str) and value.strip():
-            yield value
+            yield _as_path(value)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if isinstance(item, str) and item.strip():
-                    yield item
+                    yield _as_path(item)
 
 
 def extract_paths(tool_input: dict[str, Any]) -> list[str]:

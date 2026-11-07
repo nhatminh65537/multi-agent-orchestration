@@ -227,6 +227,9 @@ class WorkerSession(abc.ABC):
         # Progress + inbox: the manager reads these directly, no tokens spent.
         self.inbox: list[str] = []
         self.touched_files: set[str] = set()
+        # Denied tool calls (tool + argument keys + reason). The SDK only tells
+        # the model the policy *name*, so the manager log carries the detail.
+        self.denials: list[str] = []
         self.steps = 0
         self.last_tool = ""
         self.last_activity = _now()
@@ -280,6 +283,7 @@ class WorkerSession(abc.ABC):
         self._needs_approval = list(packet.needs_approval)
         self._read_only = packet.read_only
         self.touched_files.clear()
+        self.denials.clear()
 
     def system_prompt(self) -> str:
         # `agy-sdk` loads `.agents/skills` natively; only skip inlining when the project has skills.
@@ -452,31 +456,59 @@ class AntigravityWorkerSession(WorkerSession):
         def guard(tool_name: str, args: Any) -> bool:
             """Run the policy check, record progress, return `deny?`."""
             data = args if isinstance(args, dict) else getattr(args, "model_dump", lambda: {})()
-            allowed, _ = self._allowed(tool_name, data)
+            allowed, reason = self._allowed(tool_name, data)
+            if not allowed:
+                # The harness shows the model only `Denied by policy '<name>'`,
+                # so keep the real reason for `.coord/logs/<task>.md`.
+                self.denials.append(f"`{tool_name}` args={sorted(data) or '-'} -> {reason}")
+                del self.denials[:-50]  # keep the tail bounded on long turns
             return not allowed
+
+        write_reason = (
+            f"coord: a write may only target a path inside the worktree {self.worktree}. "
+            "Use a relative path (it resolves inside the worktree); if the task needs "
+            "another file, call ask_orchestrator. read_only tasks may not write at all."
+        )
+        read_reason = (
+            f"coord: reads must stay inside the worktree {self.worktree}; "
+            "call ask_orchestrator if you need another file."
+        )
+        shell_reason = (
+            "coord: workers may not run git commit/merge/push/rebase/checkout/switch/"
+            "reset/clean/worktree, nor a command listed in needs_approval. The "
+            "orchestrator reviews `git diff` and commits."
+        )
 
         return [
             policy.allow_all(),
-            policy.deny(BuiltinTools.INVOKE_SUBAGENT.value, name="coord-no-subagents"),
+            policy.deny(
+                BuiltinTools.INVOKE_SUBAGENT.value,
+                name="coord-no-subagents",
+                reason="coord: workers may not spawn subagents; do the work yourself.",
+            ),
             policy.deny(
                 BuiltinTools.CREATE_FILE.value,
                 when=lambda args: guard(BuiltinTools.CREATE_FILE.value, args),
                 name="coord-worktree-write",
+                reason=write_reason,
             ),
             policy.deny(
                 BuiltinTools.EDIT_FILE.value,
                 when=lambda args: guard(BuiltinTools.EDIT_FILE.value, args),
                 name="coord-worktree-edit",
+                reason=write_reason,
             ),
             policy.deny(
                 BuiltinTools.VIEW_FILE.value,
                 when=lambda args: guard(BuiltinTools.VIEW_FILE.value, args),
                 name="coord-worktree-read",
+                reason=read_reason,
             ),
             policy.deny(
                 BuiltinTools.RUN_COMMAND.value,
                 when=lambda args: guard(BuiltinTools.RUN_COMMAND.value, args),
                 name="coord-shell",
+                reason=shell_reason,
             ),
         ]
 
