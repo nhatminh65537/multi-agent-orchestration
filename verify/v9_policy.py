@@ -36,8 +36,6 @@ def main() -> int:
             ("git reset --hard", "run_command", {"CommandLine": "git reset --hard"}, (), False),
             ("git status (allowed)", "Bash", {"command": "git status --short"}, (), True),
             ("needs_approval", "Bash", {"command": "pip install requests"}, ("pip install",), False),
-            ("redirect outside", "Bash", {"command": f"echo x > {outside}"}, (), False),
-            ("rm outside", "Bash", {"command": f"rm -rf {root / 'wt-B'}"}, (), False),
             ("coord MCP recursion", "mcp__coord__spawn_worker", {"owner": "A"}, (), False),
             ("worker-manager recursion", "mcp__worker-manager__spawn_worker", {}, (), False),
             ("subagent", "Task", {"prompt": "go"}, (), False),

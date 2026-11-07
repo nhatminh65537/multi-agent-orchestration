@@ -48,11 +48,11 @@ async def main(url: str, clients: int, repo: Path) -> int:
             accept = json.loads(settings_path.read_text()).get("crossSessionInbound") == "accept"
         except json.JSONDecodeError:
             accept = False
-    print(f"crossSessionInbound=accept trong {settings_path}: {'có' if accept else 'KHÔNG'}")
+    print(f"crossSessionInbound=accept in {settings_path}: {'yes' if accept else 'NO'}")
     if not accept:
         ok = False
 
-    print("PASS V-12 (N client song song + crossSessionInbound)" if ok else "FAIL V-12")
+    print("PASS V-12 (N clients in parallel + crossSessionInbound)" if ok else "FAIL V-12")
     return 0 if ok else 1
 
 

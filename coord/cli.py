@@ -17,9 +17,17 @@ from typing import Any
 import httpx
 
 from . import PROTOCOL_VERSION, __version__
-from .backend import TEMPLATES, backend_status, default_backend
-from .manager import DEFAULT_HOST, DEFAULT_PORT, build_app, build_manager, coord_home
-from .paths import env
+from .backend import backend_status
+from .config import (
+    api_key,
+    base_url,
+    default_backend,
+    default_model,
+    quota_wait_seconds,
+    thinking,
+)
+from .manager import DEFAULT_HOST, DEFAULT_PORT, build_app, build_manager
+from .paths import TEMPLATES, coord_home
 
 BEGIN = "<!-- coord:begin -->"
 END = "<!-- coord:end -->"
@@ -37,12 +45,24 @@ ALLOWED_TOOLS = [
     "Bash(git merge stream-*)",
 ]
 
+# Orchestrators delegate through `coord` MCP tools, never through Claude Code's
+# built-in subagents (that would bypass the worker model and burn the session quota).
+DENIED_TOOLS = ["Agent", "Task"]
+
+BOOTSTRAP_FILES = (
+    "CLAUDE.md",
+    "AGENTS.md",
+    ".claude/settings.json",
+    ".mcp.json",
+    ".agents/skills/worker-protocol/SKILL.md",
+)
+
 
 # ------------------------------------------------------------------- helpers
 def run(cmd: list[str], cwd: Path | None = None) -> str:
     result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or f"{cmd[0]} thất bại")
+        raise RuntimeError((result.stderr or result.stdout).strip() or f"{cmd[0]} failed")
     return result.stdout.strip()
 
 
@@ -63,10 +83,10 @@ def upsert_block(path: Path, body: str) -> str:
         return "created"
 
     text = path.read_text(encoding="utf-8")
-    if BEGIN in text and END in text:
-        start = text.index(BEGIN)
-        stop = text.index(END) + len(END)
-        updated = text[:start] + block + text[stop:]
+    start = text.find(BEGIN)
+    stop = text.find(END)
+    if start != -1 and stop > start:
+        updated = text[:start] + block + text[stop + len(END) :]
         if updated == text:
             return "unchanged"
         path.write_text(updated, encoding="utf-8")
@@ -78,13 +98,42 @@ def upsert_block(path: Path, body: str) -> str:
     return "appended"
 
 
+def write_text_file(path: Path, body: str) -> str:
+    """Write a whole bootstrap file; `created` / `updated` / `unchanged`."""
+    if path.is_file():
+        if path.read_text(encoding="utf-8") == body:
+            return "unchanged"
+        path.write_text(body, encoding="utf-8")
+        return "updated"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return "created"
+
+
+def sync_bootstrap(source: Path, target: Path) -> list[str]:
+    """Copy the five bootstrap files from `source` into an existing worktree."""
+    changed: list[str] = []
+    for rel in BOOTSTRAP_FILES:
+        src = source / rel
+        if not src.is_file():
+            continue
+        body = src.read_text(encoding="utf-8")
+        dst = target / rel
+        if dst.is_file() and dst.read_text(encoding="utf-8") == body:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(body, encoding="utf-8")
+        changed.append(rel)
+    return changed
+
+
 def merge_settings(path: Path) -> str:
     data: dict[str, Any] = {}
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8") or "{}")
         except json.JSONDecodeError as exc:
-            return f"bỏ qua (JSON lỗi: {exc})"
+            return f"skipped (invalid JSON: {exc})"
 
     before = json.dumps(data, sort_keys=True)
     data.setdefault("crossSessionInbound", "accept")
@@ -94,6 +143,10 @@ def merge_settings(path: Path) -> str:
     for item in ALLOWED_TOOLS:
         if item not in allow:
             allow.append(item)
+    deny = permissions.setdefault("deny", [])
+    for item in DENIED_TOOLS:
+        if item not in deny:
+            deny.append(item)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -101,17 +154,19 @@ def merge_settings(path: Path) -> str:
 
 
 def merge_mcp_json(path: Path) -> str:
-    """Register the coord server project-locally (works without the plugin)."""
+    """Register/replace the coord server project-locally (works without the plugin)."""
     data: dict[str, Any] = {}
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8") or "{}")
         except json.JSONDecodeError as exc:
-            return f"bỏ qua (JSON lỗi: {exc})"
+            return f"skipped (invalid JSON: {exc})"
 
     before = json.dumps(data, sort_keys=True)
     servers = data.setdefault("mcpServers", {})
-    servers.setdefault("coord", {"type": "http", "url": MCP_URL})
+    # Overwrite on purpose: re-running `coord init` must repair a stale URL.
+    servers["coord"] = {"type": "http", "url": MCP_URL}
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return "unchanged" if before == json.dumps(data, sort_keys=True) else "updated"
 
@@ -177,15 +232,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"  = AGENTS.md: {upsert_block(written['agents'], template('AGENTS.md'))}")
     print(f"  = .claude/settings.json: {merge_settings(written['settings'])}")
     print(f"  = .mcp.json: {merge_mcp_json(written['mcp'])}")
-    worker_skill = written["worker_skill"]
-    if not worker_skill.exists():
-        worker_skill.parent.mkdir(parents=True, exist_ok=True)
-        worker_skill.write_text(
-            template("agents/skills/worker-protocol/SKILL.md"), encoding="utf-8"
+    print(
+        "  = .agents/skills/worker-protocol/SKILL.md: "
+        + write_text_file(
+            written["worker_skill"],
+            template("agents/skills/worker-protocol/SKILL.md"),
         )
-        print("  + .agents/skills/worker-protocol/SKILL.md")
-    else:
-        print("  = .agents/skills/worker-protocol/SKILL.md: đã tồn tại")
+    )
 
     # 2. Commit those files (only those) so every worktree gets them.
     commit_state = "skipped (--no-commit)"
@@ -204,60 +257,46 @@ def cmd_init(args: argparse.Namespace) -> int:
             )
         except RuntimeError as exc:
             commit_state = f"FAILED: {exc}"
-            print(f"  ! bootstrap commit thất bại: {exc}")
-            print("    đặt `git config user.name` / `user.email` rồi chạy lại;")
-            print("    worktree sẽ được tạo nhưng thiếu file bootstrap (sẽ copy bù).")
+            print(f"  ! bootstrap commit failed: {exc}")
+            print("    set `git config user.name` / `user.email` and re-run;")
+            print("    the worktrees are created but miss the bootstrap files (copied below).")
     print(f"  = bootstrap commit: {commit_state}")
 
-    # 3. Worktrees, now based on the commit above.
+    # 3. Worktrees: `wt-<project>-<name>` so two projects never collide, and
+    #    re-running `coord init` re-syncs the bootstrap in *existing* worktrees.
+    report = repo.name
     for name in names:
         branch = f"{args.branch_prefix}{name}"
-        path = root / f"wt-{name}"
+        path = root / f"wt-{report}-{name}"
         if path.exists():
-            print(f"  = wt-{name} đã tồn tại, bỏ qua")
-            continue
-        has_branch = False
-        try:
-            run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo)
-            has_branch = True
-        except RuntimeError:
+            print(f"  = {path.name} already exists, keeping its worktree/branch")
+        else:
             has_branch = False
-        cmd = ["git", "worktree", "add", "-q", str(path)]
-        cmd += [branch] if has_branch else ["-b", branch]
-        try:
-            run(cmd, cwd=repo)
-            print(f"  + wt-{name} ({branch})")
-        except RuntimeError as exc:
-            print(f"  ! wt-{name}: {exc}")
-            continue
+            try:
+                run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo)
+                has_branch = True
+            except RuntimeError:
+                has_branch = False
+            cmd = ["git", "worktree", "add", "-q", str(path)]
+            cmd += [branch] if has_branch else ["-b", branch]
+            try:
+                run(cmd, cwd=repo)
+                print(f"  + {path.name} ({branch})")
+            except RuntimeError as exc:
+                print(f"  ! {path.name}: {exc}")
+                continue
 
-        missing = [
-            rel
-            for rel in (
-                "CLAUDE.md",
-                "AGENTS.md",
-                ".claude/settings.json",
-                ".mcp.json",
-                ".agents/skills/worker-protocol/SKILL.md",
-            )
-            if not (path / rel).exists()
-        ]
-        if missing:
-            for rel in missing:
-                src = repo / rel
-                if not src.exists():
-                    continue
-                (path / rel).parent.mkdir(parents=True, exist_ok=True)
-                (path / rel).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-            print(f"    (copy bù vào worktree: {', '.join(missing)})")
+        changed = sync_bootstrap(repo, path)
+        if changed:
+            print(f"    (synced into {path.name}: {', '.join(changed)})")
 
     print(
-        "\nTiếp theo:\n"
-        "  1. coord up               # Worker Manager (một lần cho cả máy)\n"
-        f"  2. mở {len(names)} session Claude Code tại "
-        + ", ".join(f"{root / f'wt-{n}'}" for n in names)
-        + "\n  3. trong mỗi session: /rename <tên>, rồi gửi bootstrap prompt\n"
-        "     (skill orchestrator, mục A)"
+        "\nNext:\n"
+        "  1. coord up               # Worker Manager (once per machine)\n"
+        f"  2. open {len(names)} Claude Code session(s) in "
+        + ", ".join(f"{root / f'wt-{report}-{n}'}" for n in names)
+        + "\n  3. in each session: /rename <name>, then send the bootstrap prompt\n"
+        "     (orchestrator skill, section A)"
     )
     return 0
 
@@ -265,14 +304,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     manager = build_manager(model=args.model, backend=args.backend)
     app = build_app(manager, host=args.host, port=args.port)
-    key = env("WORKER_API_KEY", "COORD_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
     print(
         f"coord {__version__} (protocol v{PROTOCOL_VERSION})\n"
         f"  mcp:      http://{args.host}:{args.port}/mcp\n"
         f"  backend:  {manager.backend}\n"
         f"  model:    {manager.model}\n"
+        f"  thinking: {thinking()}\n"
         f"  state:    {coord_home() / 'coord.db'}\n"
-        f"  api key:  {'đã đặt' if key else 'CHƯA đặt WORKER_API_KEY'}"
+        f"  api key:  {'set' if api_key() else 'MISSING WORKER_API_KEY'}"
     )
     try:
         app.run(transport="streamable-http")
@@ -287,7 +326,7 @@ def cmd_msg(args: argparse.Namespace) -> int:
     if args.list:
         records = sorted(load_records(), key=lambda x: x.get("pid", 0))
         if not records:
-            print("(không tìm thấy session Claude Code nào)")
+            print("(no Claude Code session found)")
             return 0
         print("%-7s %-32s %-10s %s" % ("PID", "NAME", "STATUS", "SOCKET"))
         for r in records:
@@ -303,40 +342,43 @@ def cmd_msg(args: argparse.Namespace) -> int:
         return 0
 
     if not args.target or not args.text:
-        print("lỗi: cần truyền target và text (hoặc --list)", file=sys.stderr)
+        print("error: target and text are required (or use --list)", file=sys.stderr)
         return 2
 
     ok, detail = send_session_message(args.target, args.text)
     if ok:
-        print(f"đã gửi tới {args.target}")
+        print(f"sent to {args.target}")
         return 0
-    print(f"không gửi được: {detail}", file=sys.stderr)
+    print(f"delivery failed: {detail}", file=sys.stderr)
     return 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     params = {k: v for k, v in (("owner", args.owner), ("project", args.project)) if v}
+    if args.all:
+        params["include_all"] = "true"
     try:
         rows = httpx.get(
             f"{server_url(args.host, args.port)}/api/status", params=params, timeout=10
         ).json()
     except Exception as exc:  # noqa: BLE001
-        print(f"không gọi được Worker Manager tại {server_url(args.host, args.port)}: {exc}")
-        print("chạy `coord serve` trước.")
+        print(f"cannot reach the Worker Manager at {server_url(args.host, args.port)}: {exc}")
+        print("run `coord serve` first.")
         return 1
 
     if not rows:
-        print("(không có worker)")
+        print("(no workers)")
         return 0
-    header = ("worker", "owner", "state", "task", "parent", "backend", "asks")
+    header = ("worker", "owner", "state", "task", "backend", "steps", "last", "asks")
     table = [
         (
             r["worker_id"],
             r["owner"],
             r["state"],
             r["task_id"] or "-",
-            r["parent"] or "-",
             r.get("backend") or "-",
+            str(r.get("steps") or 0),
+            (r.get("last_tool") or "-")[:16],
             ",".join(r["pending_questions"]) or "-",
         )
         for r in rows
@@ -354,35 +396,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         rows.append((label, "OK" if ok else ("WARN" if warn else "FAIL"), detail))
 
     check("python", sys.version_info >= (3, 10), sys.version.split()[0])
-    check("git", shutil.which("git") is not None, shutil.which("git") or "không thấy")
-    check("uv", shutil.which("uv") is not None, shutil.which("uv") or "không thấy", warn=True)
+    check("git", shutil.which("git") is not None, shutil.which("git") or "not found")
+    check("uv", shutil.which("uv") is not None, shutil.which("uv") or "not found", warn=True)
 
-    key = env("WORKER_API_KEY", "COORD_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
-    backend = (env("WORKER_BACKEND", "COORD_BACKEND", default=default_backend()) or default_backend()).lower()
-    base_url = env("WORKER_BASE_URL", "COORD_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BASE_URL")
-    model = env("WORKER_MODEL", "COORD_MODEL")
+    backend = default_backend()
     check("backend", True, backend)
     for name, available, detail in backend_status():
         check(f"sdk:{name}", available, detail, warn=name != backend)
-    check(
-        "api key",
-        bool(key),
-        "đã đặt" if key else "đặt WORKER_API_KEY (hoặc COORD_API_KEY / GEMINI_API_KEY)",
-    )
-    check("base url", True, base_url or "mặc định của backend")
-    check("model", True, model or "mặc định của backend")
+    check("api key", bool(api_key()), "set" if api_key() else "set WORKER_API_KEY in .env")
+    check("base url", True, base_url() or "backend default")
+    check("model", True, default_model(backend))
+    check("thinking", True, thinking())
+    check("quota wait", True, f"{quota_wait_seconds():.0f}s")
     check("coord home", True, str(coord_home()))
     cfg = getattr(args, "loaded_config", None)
     if cfg and Path(cfg).is_file():
         check("config file", True, str(Path(cfg).resolve()))
     else:
-        check("config file", False, "chưa cấu hình (dùng --config hoặc tạo .env)", warn=True)
+        check("config file", False, "not configured (use --config or create .env)", warn=True)
 
     try:
         health = httpx.get(f"{server_url(args.host, args.port)}/health", timeout=5)
         check("server", health.status_code == 200, f"{server_url(args.host, args.port)}")
     except Exception as exc:  # noqa: BLE001
-        check("server", False, f"chưa chạy `coord serve` ({type(exc).__name__})", warn=True)
+        check("server", False, f"`coord serve` not running ({type(exc).__name__})", warn=True)
 
     try:
         repo = git_repo_root(Path(args.repo).resolve())
@@ -410,10 +447,10 @@ def _health(host: str, port: int) -> bool:
 
 
 def cmd_up(args: argparse.Namespace) -> int:
-    """Idempotent: chạy `coord serve` ở nền nếu chưa có, rồi chờ /health."""
+    """Idempotent: start `coord serve` in the background if needed, then wait for /health."""
     url = server_url(args.host, args.port)
     if _health(args.host, args.port):
-        print(f"coord đã chạy: {url}")
+        print(f"coord is already running: {url}")
         print(f"  mcp:    {url}/mcp")
         return 0
 
@@ -439,17 +476,20 @@ def cmd_up(args: argparse.Namespace) -> int:
     if getattr(args, "config", None):
         cmd += ["--config", str(Path(args.config).resolve())]
 
+    child_env = os.environ.copy()
+    # Windows consoles default to cp1252; force UTF-8 so the log never raises UnicodeEncodeError.
+    child_env["PYTHONUTF8"] = "1"
     with log_path.open("ab") as log:
         kwargs = {"start_new_session": True} if os.name == "posix" else {}
         proc = subprocess.Popen(
-            cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(), **kwargs
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=child_env, **kwargs
         )
     pid_path.write_text(str(proc.pid), encoding="utf-8")
 
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if _health(args.host, args.port):
-            print(f"coord đã lên: {url}  (pid {proc.pid})")
+            print(f"coord is up: {url}  (pid {proc.pid})")
             print(f"  mcp:    {url}/mcp")
             print(f"  log:    {log_path}")
             return 0
@@ -457,30 +497,30 @@ def cmd_up(args: argparse.Namespace) -> int:
             break
         time.sleep(0.5)
 
-    print(f"coord up thất bại (xem {log_path})")
+    print(f"coord up failed (see {log_path})")
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]:
         print(f"  {line}")
     return 1
 
 
 def cmd_down(args: argparse.Namespace) -> int:
-    """Dừng tiến trình do `coord up` khởi động."""
+    """Stop the process started by `coord up`."""
     pid_path = coord_home() / "coord.pid"
     if not pid_path.is_file():
-        print("không thấy PID (coord up chưa chạy?)")
+        print("no PID file (was `coord up` ever run?)")
         return 1
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except ValueError:
         pid_path.unlink(missing_ok=True)
-        print("PID không hợp lệ; đã xoá file")
+        print("invalid PID; removed the file")
         return 1
 
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         pid_path.unlink(missing_ok=True)
-        print("tiến trình không còn chạy")
+        print("process is no longer running")
         return 0
 
     for _ in range(20):
@@ -488,11 +528,12 @@ def cmd_down(args: argparse.Namespace) -> int:
             break
         time.sleep(0.25)
     else:
+        # Windows has no signal.SIGKILL; SIGTERM is the strongest signal available there.
         with contextlib.suppress(ProcessLookupError, OSError):
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
     pid_path.unlink(missing_ok=True)
-    print("đã dừng coordinator")
+    print("coordinator stopped")
     return 0
 
 
@@ -503,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         "-c",
         default=argparse.SUPPRESS,
-        help="đường dẫn tới file cấu hình (.env)",
+        help="path to the config file (.env)",
     )
 
     parser = argparse.ArgumentParser(
@@ -514,7 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"coord {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve = sub.add_parser("serve", parents=[config_parent], help="chạy Worker Manager (MCP streamable-http)")
+    serve = sub.add_parser(
+        "serve", parents=[config_parent], help="run the Worker Manager (MCP streamable-http)"
+    )
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     serve.add_argument("--model", default=None)
@@ -522,42 +565,71 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend",
         default=None,
         choices=["agy-sdk", "claude-sdk"],
-        help="backend của worker (mặc định: $COORD_BACKEND hoặc agy-sdk)",
+        help="worker backend (default: $WORKER_BACKEND or agy-sdk)",
     )
 
-    up = sub.add_parser("up", parents=[config_parent], help="chạy Worker Manager ở nền nếu chưa chạy, rồi kiểm tra /health")
+    up = sub.add_parser(
+        "up",
+        parents=[config_parent],
+        help="start the Worker Manager in the background if needed, then check /health",
+    )
     up.add_argument("--host", default=DEFAULT_HOST)
     up.add_argument("--port", type=int, default=DEFAULT_PORT)
     up.add_argument("--backend", default=None, choices=["agy-sdk", "claude-sdk"])
     up.add_argument("--model", default=None)
 
-    down = sub.add_parser("down", parents=[config_parent], help="dừng Worker Manager đã do `coord up` khởi động")
+    down = sub.add_parser(
+        "down",
+        parents=[config_parent],
+        help="stop the Worker Manager started by `coord up`",
+    )
     down.add_argument("--host", default=DEFAULT_HOST)
     down.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    msg = sub.add_parser("msg", parents=[config_parent], help="gửi tin nhắn trực tiếp vào một session Claude Code qua IPC socket")
-    msg.add_argument("target", nargs="?", help="tên session, session id, PID, hoặc socket path")
-    msg.add_argument("text", nargs="?", help="nội dung tin nhắn")
-    msg.add_argument("-l", "--list", action="store_true", help="liệt kê các session Claude Code đang chạy")
+    msg = sub.add_parser(
+        "msg",
+        parents=[config_parent],
+        help="send a message straight into a Claude Code session over its IPC socket",
+    )
+    msg.add_argument("target", nargs="?", help="session name, session id, PID, or socket path")
+    msg.add_argument("text", nargs="?", help="message body")
+    msg.add_argument(
+        "-l", "--list", action="store_true", help="list the running Claude Code sessions"
+    )
 
-    init = sub.add_parser("init", parents=[config_parent], help="tạo worktree + .coord/ + template trong repo")
-    init.add_argument("names", nargs="*", help="tên orchestrator (mặc định: A B C)")
-    init.add_argument("--repo", default=".", help="repo đích (mặc định: thư mục hiện tại)")
-    init.add_argument("--worktree-root", default="..", help="thư mục chứa wt-<name> (mặc định: ..)")
+    init = sub.add_parser(
+        "init",
+        parents=[config_parent],
+        help="create worktrees + .coord/ + the bootstrap templates",
+    )
+    init.add_argument("names", nargs="*", help="orchestrator names (default: A B C)")
+    init.add_argument("--repo", default=".", help="target repo (default: current directory)")
+    init.add_argument(
+        "--worktree-root",
+        default="..",
+        help="directory that holds wt-<project>-<name> (default: ..)",
+    )
     init.add_argument("--branch-prefix", default="stream-")
     init.add_argument(
         "--no-commit",
         action="store_true",
-        help="chỉ ghi file, không commit bootstrap (worktree sẽ thiếu file, có copy bù)",
+        help="write the files but skip the bootstrap commit (worktrees get a plain copy)",
     )
 
-    status = sub.add_parser("status", parents=[config_parent], help="liệt kê worker từ server đang chạy")
+    status = sub.add_parser(
+        "status", parents=[config_parent], help="list workers from the running server"
+    )
     status.add_argument("--owner", default=None)
     status.add_argument("--project", default=None)
+    status.add_argument(
+        "--all", action="store_true", help="also show old FAILED/KILLED workers"
+    )
     status.add_argument("--host", default=DEFAULT_HOST)
     status.add_argument("--port", type=int, default=DEFAULT_PORT)
 
-    doctor = sub.add_parser("doctor", parents=[config_parent], help="kiểm tra môi trường và server")
+    doctor = sub.add_parser(
+        "doctor", parents=[config_parent], help="check the environment and the server"
+    )
     doctor.add_argument("--repo", default=".")
     doctor.add_argument("--host", default=DEFAULT_HOST)
     doctor.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -577,6 +649,11 @@ COMMANDS = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to cp1252; force UTF-8 so output never crashes.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     args = build_parser().parse_args(argv)
     from .config import load_env_file
 

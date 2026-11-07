@@ -1,14 +1,13 @@
-"""Policy hook (V-9) — one implementation shared by every backend driver.
+"""Policy hook (V-9) — one pure function shared by every backend driver.
 
-The hook is deliberately a pure function so it can be unit-tested without any
-SDK, and so both `claude-sdk` and `agy-sdk` enforce exactly the same rules.
-
-Rules (Protocol v0.4 §3.3.1):
+Only the tool names the two real harnesses use are listed here (`agy-sdk`
+`BuiltinTools` and the Claude Code harness). Rules:
 
 * P-1  the worker may not call the coordinator MCP tools, nor spawn subagents;
-* P-2  write tools may only touch paths inside the assigned worktree;
-* P-3  shell commands may not run history-rewriting / publishing git verbs;
-* P-4  shell commands may not contain anything listed in `needs_approval`.
+* P-2  reads and writes stay inside the assigned worktree;
+* P-3  a `read_only` task may not use any write tool;
+* P-4  shell commands may not run history-rewriting / publishing git verbs, nor
+       anything listed in `needs_approval`.
 """
 
 from __future__ import annotations
@@ -17,54 +16,24 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-# --------------------------------------------------------------------- names
+# Only the tool names the two real harnesses use: `claude-sdk` (Write/Edit/Read/Bash…)
+# and `agy-sdk` `BuiltinTools` (create_file/edit_file/view_file/run_command…).
 WRITE_TOOLS = frozenset(
     {
-        "write",
-        "edit",
-        "multiedit",
-        "multi_edit",
-        "notebookedit",
-        "notebook_edit",
-        "str_replace",
-        "str_replace_editor",
-        "apply_patch",
-        "write_file",
-        "edit_file",
-        "create_file",
-        "delete_file",
-        "move_file",
-        "remove_file",
-        "create_directory",
+        "write", "edit", "multiedit", "notebookedit",  # claude-sdk
+        "create_file", "edit_file",  # agy-sdk
+        "write_file", "delete_file", "move_file", "create_directory",  # MCP-style
     }
 )
-
 READ_TOOLS = frozenset(
     {
-        "read",
-        "read_file",
-        "view_file",
-        "grep",
-        "glob",
-        "search_directory",
-        "find_file",
-        "list_dir",
-        "list_directory",
-        "web_search",
-        "websearch",
-        "web_fetch",
-        "webfetch",
-        "search_web",
-        "read_url_content",
+        "read", "grep", "glob", "websearch", "webfetch",  # claude-sdk
+        "view_file", "list_directory", "search_directory",  # agy-sdk
+        "find_file", "search_web", "read_url_content",
     }
 )
-
-SHELL_TOOLS = frozenset(
-    {"bash", "run_shell", "run_command", "shell", "execute_command", "terminal"}
-)
-
+SHELL_TOOLS = frozenset({"bash", "run_command", "run_shell"})
 DELEGATION_TOOLS = frozenset({"agent", "task", "invoke_subagent"})
-
 COORD_MCP_PREFIXES = ("mcp__coord__", "mcp__worker-manager__")
 
 FORBIDDEN_GIT_RE = re.compile(
@@ -72,24 +41,8 @@ FORBIDDEN_GIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_REDIRECT_RE = re.compile(r"(?:^|[^>0-9&])>>?\s*([^\s;|&<>]+)")
-_MUTATING_CMDS = ("rm", "mv", "cp", "touch", "mkdir", "tee", "dd", "chmod", "chown", "ln", "truncate")
-
-_PATH_KEYS = (
-    "file_path",
-    "filePath",
-    "path",
-    "Path",
-    "target_file",
-    "targetFile",
-    "notebook_path",
-    "absolute_path",
-    "AbsolutePath",
-    "directory",
-    "DirectoryPath",
-    "cwd",
-    "workspace",
-)
+_PATH_KEYS = ("file_path", "filePath", "path", "Path", "target_file", "notebook_path", "directory")
+_COMMAND_KEYS = ("command", "cmd", "CommandLine", "command_line", "script", "shell")
 
 
 # ------------------------------------------------------------------- helpers
@@ -97,14 +50,13 @@ def normalise_tool_name(tool_name: str) -> str:
     name = (tool_name or "").strip()
     if name.startswith("mcp__"):
         return name
-    # Claude uses `Bash(ls:*)` style matchers in allow-lists, not here, but be safe.
-    if "(" in name:
+    if "(" in name:  # Claude `Bash(ls:*)` style matchers
         name = name.split("(", 1)[0]
     return name.strip().lower().replace("-", "_")
 
 
 def resolve_target(path: str | Path, worktree: Path) -> Path:
-    """Absolute, symlink-resolved path; relative paths are resolved inside `worktree`."""
+    """Absolute, symlink-resolved path; relative paths resolve inside `worktree`."""
     target = Path(str(path)).expanduser()
     if not target.is_absolute():
         target = worktree / target
@@ -136,7 +88,7 @@ def extract_paths(tool_input: dict[str, Any]) -> list[str]:
 
 
 def extract_command(tool_input: dict[str, Any]) -> str:
-    for key in ("command", "cmd", "CommandLine", "command_line", "script", "shell"):
+    for key in _COMMAND_KEYS:
         value = (tool_input or {}).get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -144,34 +96,6 @@ def extract_command(tool_input: dict[str, Any]) -> str:
     if isinstance(commands, (list, tuple)):
         return " && ".join(str(c) for c in commands)
     return ""
-
-
-def _shell_escapes_worktree(command: str, worktree: Path) -> str | None:
-    """Best-effort detection of writes aimed outside the worktree."""
-    for match in _REDIRECT_RE.finditer(command):
-        target = match.group(1)
-        if target.startswith(("/dev/", "/proc/")):
-            continue
-        if any(ch in target for ch in ("/", "~")) and not is_path_inside_worktree(
-            target, worktree
-        ):
-            return f"chuyển hướng output ra ngoài worktree: {target}"
-
-    for segment in re.split(r"[;&|\n]+", command):
-        tokens = segment.strip().split()
-        if not tokens:
-            continue
-        head = Path(tokens[0]).name
-        if head not in _MUTATING_CMDS:
-            continue
-        for token in tokens[1:]:
-            if token.startswith("-"):
-                continue
-            if token.startswith(("/", "~", "..")) and not is_path_inside_worktree(
-                token, worktree
-            ):
-                return f"{head} nhắm ra ngoài worktree: {token}"
-    return None
 
 
 # ---------------------------------------------------------------------- hook
@@ -182,6 +106,7 @@ def check_tool_policy(
     needs_approval: Sequence[str] = (),
     *,
     allow_read_outside: bool = False,
+    read_only: bool = False,
 ) -> tuple[bool, str]:
     """Return `(allowed, reason)`. `reason` is shown to the model when denied."""
     raw = tool_name or ""
@@ -190,27 +115,33 @@ def check_tool_policy(
     worktree = Path(worktree)
 
     # P-1: no recursion into the coordinator, no spawning subagents.
-    lowered = raw.lower()
-    if lowered.startswith(COORD_MCP_PREFIXES) or name in DELEGATION_TOOLS:
+    if raw.lower().startswith(COORD_MCP_PREFIXES) or name in DELEGATION_TOOLS:
         return (
             False,
-            f"Policy Hook (V-9): worker không được gọi tool điều phối {raw!r} "
-            "(chống đệ quy spawn_worker).",
+            f"Policy Hook (V-9): workers may not call the coordinator tool {raw!r} "
+            "(recursive spawn_worker protection).",
         )
 
-    # P-2a: write inside the worktree only.
+    # P-3: a read-only task may not write anything.
+    if read_only and name in WRITE_TOOLS:
+        return (
+            False,
+            f"Policy Hook (V-9): this task is read_only, so the write tool {raw!r} is blocked.",
+        )
+
+    # P-2a: writes inside the worktree only.
     if name in WRITE_TOOLS:
         paths = extract_paths(data)
         if not paths:
             return (
                 False,
-                f"Policy Hook (V-9): tool ghi {raw!r} thiếu đường dẫn, không thể kiểm chứng.",
+                f"Policy Hook (V-9): write tool {raw!r} has no path, so it cannot be verified.",
             )
         for path in paths:
             if not is_path_inside_worktree(path, worktree):
                 return (
                     False,
-                    f"Policy Hook (V-9): từ chối ghi {path!r} nằm ngoài worktree {worktree}.",
+                    f"Policy Hook (V-9): refusing to write {path!r} outside worktree {worktree}.",
                 )
 
     # P-2b: reads stay inside the worktree unless the task says otherwise.
@@ -221,29 +152,26 @@ def check_tool_policy(
             if not is_path_inside_worktree(path, worktree):
                 return (
                     False,
-                    f"Policy Hook (V-9): từ chối đọc {path!r} ngoài worktree {worktree}.",
+                    f"Policy Hook (V-9): refusing to read {path!r} outside worktree {worktree}.",
                 )
 
-    # P-3 / P-4: shell commands.
+    # P-4: shell commands.
     if name in SHELL_TOOLS or "command" in data or "CommandLine" in data:
         command = extract_command(data)
         if FORBIDDEN_GIT_RE.search(command):
             return (
                 False,
-                "Policy Hook (V-9): worker không được chạy git "
+                "Policy Hook (V-9): workers may not run git "
                 "commit/merge/push/rebase/checkout/switch/reset/clean/worktree. "
-                "Orchestrator sẽ review `git diff` và tự commit.",
+                "The orchestrator reviews `git diff` and commits.",
             )
         for forbidden in needs_approval:
             if forbidden and forbidden in command:
                 return (
                     False,
-                    f"Policy Hook (V-9): lệnh chứa hành động nằm trong needs_approval "
-                    f"({forbidden!r}). Hãy gọi ask_orchestrator nếu thật sự cần.",
+                    f"Policy Hook (V-9): the command uses an action listed in "
+                    f"needs_approval ({forbidden!r}). Call ask_orchestrator if you really need it.",
                 )
-        escape = _shell_escapes_worktree(command, worktree)
-        if escape:
-            return False, f"Policy Hook (V-9): {escape}."
 
     return True, ""
 
@@ -252,6 +180,6 @@ def describe_policy(worktree: Path, needs_approval: Sequence[str] = ()) -> str:
     """Short human-readable summary, used in logs and `coord doctor`."""
     extra = ", ".join(needs_approval) or "-"
     return (
-        f"worktree={worktree}; cấm ghi ngoài worktree; cấm git commit/merge/push/"
-        f"rebase/checkout/switch/reset/clean/worktree; needs_approval={extra}"
+        f"worktree={worktree}; no writes outside the worktree; no git "
+        f"commit/merge/push/rebase/checkout/switch/reset/clean/worktree; needs_approval={extra}"
     )

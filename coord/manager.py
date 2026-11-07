@@ -1,17 +1,24 @@
 """Worker Manager: MCP tools, owner checks, durable event stream.
 
-Một tiến trình phục vụ toàn máy. Tool nhận `worktree` (đường dẫn tuyệt đối) nên
-một server quản được nhiều project; `coord.db` nằm trong `COORD_HOME`, log nằm ở
-`.coord/logs/` của từng project.
+One process serves the whole machine. Tools take `worktree` (absolute path) so a
+single server manages many projects; `coord.db` lives in `COORD_HOME`, logs live
+in each project's `.coord/logs/`.
 
-Hành vi Protocol v0.5:
+Protocol v0.6 behaviour:
 
-* chọn backend + khôi phục session (V-8);
-* event bền vững, fan-out, replay (ADR-017);
-* dọn trạng thái khi khởi động lại (BUG-04);
-* chặn xung đột `files` trên cùng worktree (ADR-019);
-* **Manager** ghi `.coord/logs/<task>.md`, worker không ghi (ADR-016);
-* `kill` không bị `finally` của `ask_orchestrator` ghi đè (BUG-06a).
+* workers **answer in free-form prose** at the end of a turn; `session.run()` ->
+  `str` is the task result (a leading `FAILED:` means failure) — there is no
+  `report_completion` any more;
+* `send()` accepts an `IDLE` worker (new turn), a `RUNNING` worker (queued in
+  `inbox`, runs right after the current turn) and a `WAITING_ANSWER` worker
+  (the text answers the pending question);
+* provider/API errors (quota, rate limit, overload) are classified, waited out
+  by the worker and forwarded to the orchestrator when the worker gives up;
+* durable, replayable event stream (ADR-017);
+* state cleanup on restart (BUG-04);
+* `files` overlap guard on the same worktree (ADR-019);
+* the **manager** writes `.coord/logs/<task>.md`; workers never write it (ADR-016);
+* `kill` is not overridden by the `finally` of `ask_orchestrator` (BUG-06a).
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -27,17 +35,12 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from .backend import (
-    BackendUnavailable,
-    WorkerSession,
-    build_session,
-    default_backend,
-    default_model,
-)
+from .backend import BackendUnavailable, WorkerSession, build_session, classify_error
+from .config import default_backend, default_model
 from .ipc import async_send_session_message
-from .models import TaskPacket, WorkerReport, validate_owner
-from .paths import coord_dir, coord_home, project_root  # noqa: F401 (re-export)
-from .policy import describe_policy
+from .models import TaskPacket, validate_owner
+from .paths import coord_dir, coord_home, project_root
+from .policy import describe_policy, resolve_target
 from .store import Store
 
 DEFAULT_HOST = "127.0.0.1"
@@ -63,7 +66,7 @@ class Manager:
         self.backend = (backend or default_backend()).lower()
         self.model = model or default_model(self.backend)
         self.ask_timeout = ask_timeout
-        # Chỉ dùng cho test; production để None và dùng build_session.
+        # Tests inject a fake factory; production leaves this None and uses build_session.
         self.session_factory = session_factory
 
         self.sessions: dict[str, WorkerSession] = {}
@@ -75,7 +78,7 @@ class Manager:
 
     # ------------------------------------------------------------------ restore
     def restore(self) -> None:
-        """Đồng bộ DB với RAM rỗng (V-8, BUG-04)."""
+        """Bring the DB in sync with an empty RAM (V-8, BUG-04)."""
         for question in self.store.pending_question_rows():
             self.store.answer_question(question["id"], RESTART_ANSWER)
         for row in self.store.states():
@@ -89,20 +92,23 @@ class Manager:
 
     # ------------------------------------------------------------------ events
     def emit(self, owner: str, line: str, push_message: str | None = None) -> None:
-        """Lưu event vào store và đẩy thẳng vào Claude Code session (ADR-021)."""
+        """Persist an event and push it straight into the Claude Code session (ADR-021)."""
         self.store.add_event(owner, line)
         self._notify_session(owner, push_message or line)
 
     def _notify_session(self, owner: str, text: str) -> None:
-        """Đẩy event trực tiếp vào session Claude Code tương ứng qua IPC (ADR-021)."""
+        """Push an event into the matching Claude Code session over IPC (ADR-021)."""
         if not owner or owner == "?":
             return
 
         async def _dispatch() -> None:
             try:
-                await async_send_session_message(owner, text)
-            except Exception:
-                pass
+                ok, error = await async_send_session_message(owner, text)
+            except Exception as exc:  # noqa: BLE001 - must never kill the manager
+                ok, error = False, f"{type(exc).__name__}: {exc}"
+            if not ok:
+                # A silently lost DONE/ASK is exactly the failure seen in the field reports.
+                print(f"[coord] IPC delivery to session {owner!r} failed: {error}", file=sys.stderr)
 
         try:
             loop = asyncio.get_running_loop()
@@ -114,14 +120,14 @@ class Manager:
     def _require(self, worker_id: str, owner: str) -> dict[str, Any]:
         row = self.store.worker(worker_id)
         if row is None:
-            raise ValueError(f"worker không tồn tại: {worker_id}")
+            raise ValueError(f"no such worker: {worker_id}")
         if row["owner"] != owner:
-            raise ValueError(f"{worker_id} thuộc owner {row['owner']!r}, không phải {owner!r}")
+            raise ValueError(f"{worker_id} belongs to owner {row['owner']!r}, not {owner!r}")
         return row
 
     def _assert_no_overlap(self, worktree: Path, packet: TaskPacket) -> None:
-        """ADR-019 / R-13: hai worker ghi trên cùng worktree không được trùng file."""
-        if packet.is_read_only or not packet.files:
+        """ADR-019 / R-13: two workers on one worktree may not write the same files."""
+        if packet.read_only or not packet.files:
             return
         mine = {str(item).strip() for item in packet.files if str(item).strip()}
         for row in self.store.active_workers_on(str(worktree)):
@@ -134,8 +140,8 @@ class Manager:
             overlap = mine & {str(item).strip() for item in theirs}
             if overlap:
                 raise ValueError(
-                    f"Xung đột file trên cùng worktree với worker {row['id']}: "
-                    f"{', '.join(sorted(overlap))}. Chia lại `files` hoặc đặt read_only=true."
+                    f"File conflict on the same worktree with worker {row['id']}: "
+                    f"{', '.join(sorted(overlap))}. Re-split `files` or set read_only=true."
                 )
 
     def _new_session(
@@ -155,22 +161,22 @@ class Manager:
             worktree=worktree,
             model=self.model,
             packet=packet,
-            ask=lambda task_id, question: self._ask(worker_id, owner, task_id, question),
-            on_report=lambda report: self._record_report(worker_id, report),
+            ask=lambda question: self._ask(worker_id, owner, question),
+            notify=lambda line: self.emit(owner, line),
             session_id=session_id,
         )
 
     def _session_for(self, worker_id: str) -> WorkerSession:
-        """Lấy session đang sống, hoặc dựng lại từ DB (V-8)."""
+        """Return the live session, or rebuild it from the DB (V-8)."""
         session = self.sessions.get(worker_id)
         if session is not None:
             return session
         row = self.store.worker(worker_id)
         if row is None:
-            raise ValueError(f"worker không tồn tại: {worker_id}")
+            raise ValueError(f"no such worker: {worker_id}")
         if not row.get("session_id"):
             raise ValueError(
-                f"không còn conversation cho {worker_id}; dùng spawn_worker cho task mới"
+                f"no conversation left for {worker_id}; use spawn_worker for a new task"
             )
         session = self._new_session(
             worker_id,
@@ -185,37 +191,114 @@ class Manager:
     def _start(self, worker_id: str, text: str) -> None:
         previous = self.tasks.get(worker_id)
         if previous is not None and not previous.done():
-            raise ValueError(f"{worker_id} đang chạy; chờ report hoặc dùng answer")
+            raise ValueError(
+                f"{worker_id} is already running; use send to queue a message for the next turn"
+            )
         self.tasks[worker_id] = asyncio.create_task(self._run(worker_id, text))
 
     async def _run(self, worker_id: str, text: str) -> None:
+        """Run the current turn, then continue with anything queued in `session.inbox`."""
         session = self.sessions[worker_id]
-        owner = session.owner
         self.store.set_state(worker_id, "RUNNING")
+        self._persist(worker_id, session)
+
+        responses: list[str] = []
+        current = text
         try:
-            await session.run(text)
-        except asyncio.CancelledError:
-            raise
-        except BackendUnavailable as exc:
-            self.store.set_state(worker_id, "FAILED")
-            self.emit(owner, f"[{worker_id}] FAILED {session.task_id or '-'}: {str(exc)[:200]}")
-            self._write_log(session, None, error=str(exc))
-        except Exception as exc:  # noqa: BLE001 - một worker hỏng không được giết manager
-            self.store.set_state(worker_id, "FAILED")
-            self.emit(owner, f"[{worker_id}] FAILED {session.task_id or '-'}: {str(exc)[:200]}")
-            self._write_log(session, None, error=str(exc))
+            while True:
+                try:
+                    response = await session.run(current)
+                except asyncio.CancelledError:
+                    raise
+                except BackendUnavailable as exc:
+                    self._fail(session, str(exc))
+                    return
+                except Exception as exc:  # noqa: BLE001 - one broken worker must not kill the manager
+                    # Keep the provider's own error text; it is forwarded verbatim to the orchestrator.
+                    self._fail(session, str(classify_error(exc)))
+                    return
+
+                response = (response or "").strip()
+                if not response:
+                    self._fail(
+                        session,
+                        "worker ended the turn without returning any answer "
+                        "(possible provider/quota error; see the worker log)",
+                    )
+                    return
+
+                responses.append(response)
+                if not session.inbox:
+                    break
+                current = session.inbox.pop(0)
         finally:
             self._persist(worker_id, session)
+
+        self._finish(session, "\n\n".join(responses))
+        if session.inbox:
+            # A message arrived exactly as the turn ended: run the extra turn now.
+            self.tasks[worker_id] = asyncio.create_task(
+                self._run(worker_id, session.inbox.pop(0))
+            )
 
     def _persist(self, worker_id: str, session: WorkerSession) -> None:
         if session.sdk_session_id:
             self.store.set_session(worker_id, session.sdk_session_id)
-        messages = session.persistable_messages()
-        if messages is not None:
-            self.store.set_messages(worker_id, messages)
+
+    # ---------------------------------------------------------------- outcome
+    def _fail(self, session: WorkerSession, error: str) -> None:
+        self.store.set_state(session.worker_id, "FAILED")
+        log_path = self._write_log(session, None, passed=False, error=error)
+        task = session.task_id or "-"
+        line = f"[{session.worker_id}] FAILED {task}: {error[:200]}"
+        self.emit(
+            session.owner,
+            line,
+            push_message=f"[{session.worker_id}] FAILED {task}: {error}\nlog={log_path}",
+        )
+
+    def _finish(self, session: WorkerSession, response: str) -> None:
+        """A leading `FAILED:` means failure; anything else is a DONE."""
+        failed = response.lstrip().upper().startswith("FAILED:")
+        warning = self._outside_files_warning(session)
+        if warning:
+            response = f"{response}\n\n{warning}"
+
+        self.store.set_state(session.worker_id, "FAILED" if failed else "IDLE")
+        log_path = self._write_log(session, response, passed=not failed)
+        task = session.task_id or "-"
+        if failed:
+            first_line = response.splitlines()[0][:200]
+            self.emit(
+                session.owner,
+                f"[{session.worker_id}] FAILED {task}: {first_line}",
+                push_message=f"[{session.worker_id}] FAILED {task}: {response}\nlog={log_path}",
+            )
+            return
+        self.emit(
+            session.owner,
+            f"[{session.worker_id}] DONE {task}: {response[:200]} log={log_path}",
+            push_message=f"[{session.worker_id}] DONE {task}: {response}\nlog={log_path}",
+        )
+
+    def _outside_files_warning(self, session: WorkerSession) -> str:
+        """Warn (never block) when the worker writes outside `TaskPacket.files`."""
+        if not session.packet_files or not session.touched_files:
+            return ""
+        declared = {str(resolve_target(f, session.worktree)) for f in session.packet_files}
+        touched = {str(resolve_target(f, session.worktree)) for f in session.touched_files}
+        extra = sorted(touched - declared)
+        if not extra:
+            return ""
+        return "⚠️ Modified files outside TaskPacket.files: " + ", ".join(extra)
 
     # --------------------------------------------------------------------- ask
-    async def _ask(self, worker_id: str, owner: str, task_id: str, question: str) -> str:
+    async def _ask(self, worker_id: str, owner: str, question: str) -> str:
+        session = self.sessions.get(worker_id)
+        task_id = session.task_id if session is not None else ""
+        if not task_id:
+            row = self.store.worker(worker_id) or {}
+            task_id = row.get("task_id") or ""
         qid = uuid.uuid4().hex[:6]
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
@@ -225,7 +308,9 @@ class Manager:
         line = f"[{worker_id}] ASK q-{qid} {task_id}: {question[:120]}"
         prompt = (
             f"[{worker_id}] ASK q-{qid} {task_id}: {question}\n\n"
-            f"Trả lời bằng tool: `mcp__coord__answer(owner=\"{owner}\", question_id=\"{qid}\", text=\"...\")`"
+            f'Answer with: `mcp__coord__answer(owner="{owner}", '
+            f'question_id="{qid}", text="...")` — or just '
+            f'`send(owner="{owner}", worker_id="{worker_id}", text="...")`.'
         )
         self.emit(owner, line, push_message=prompt)
         try:
@@ -235,39 +320,23 @@ class Manager:
         finally:
             self.pending.pop(qid, None)
             row = self.store.worker(worker_id)
-            # Không "hồi sinh" worker đã bị kill khi đang chờ (BUG-06a).
+            # Never resurrect a worker that was killed while waiting (BUG-06a).
             if row and row["state"] == "WAITING_ANSWER":
                 self.store.set_state(worker_id, "RUNNING")
 
-    # ------------------------------------------------------------------ report
-    async def _record_report(self, worker_id: str, report: WorkerReport) -> None:
-        row = self.store.worker(worker_id)
-        owner = row["owner"] if row else "?"
-        session = self.sessions.get(worker_id)
-        state = "IDLE" if report.status == "DONE" else "FAILED"
-        self.store.set_state(worker_id, state)
-        self.store.add_report(worker_id, report.id, report.status, report.model_dump())
-        log_path = self._write_log(session, report) if session else "-"
-        if session is not None:
-            self._persist(worker_id, session)
-        if report.status == "DONE":
-            line = f"[{worker_id}] DONE {report.id}: {report.summary[:200]} log={log_path}"
-            push = f"[{worker_id}] DONE {report.id}: {report.summary}\nlog={log_path}"
-            self.emit(owner, line, push_message=push)
-        else:
-            line = f"[{worker_id}] FAILED {report.id}: {report.summary[:200]}"
-            self.emit(owner, line)
-
+    # -------------------------------------------------------------------- log
     def _write_log(
         self,
         session: WorkerSession,
-        report: WorkerReport | None,
+        response: str | None,
+        *,
+        passed: bool,
         error: str | None = None,
     ) -> str:
-        """ADR-016: Manager sở hữu `.coord/logs/<task-id>.md`."""
+        """ADR-016: the Manager owns `.coord/logs/<task-id>.md`."""
         logs = coord_dir(session.worktree) / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        task = (report.id if report else session.task_id) or "task"
+        task = session.task_id or "task"
         path = logs / f"{task}.md"
 
         lines = [
@@ -278,7 +347,7 @@ class Manager:
             f"- worktree: `{session.worktree}`",
             f"- backend: `{session.backend_name}`",
             f"- model: `{session.model}`",
-            f"- status: `{(report.status if report else 'FAILED')}`",
+            f"- status: `{'DONE' if passed else 'FAILED'}`",
             f"- session: `{session.sdk_session_id or '-'}`",
             "",
             "## policy",
@@ -287,11 +356,11 @@ class Manager:
         ]
         if error:
             lines += ["", "## error", "", "```", error, "```"]
-        if report:
-            lines += ["", "## report", "", "```json", report.model_dump_json(indent=2), "```"]
-        transcript = session.transcript()
-        if transcript:
-            lines += ["", "## transcript", "", transcript]
+        if response:
+            lines += ["", "## response", "", response]
+        if session.touched_files:
+            lines += ["", "## touched files", ""]
+            lines += [f"- `{item}`" for item in sorted(session.touched_files)]
 
         path.write_text("\n".join(lines), encoding="utf-8")
         return str(path)
@@ -301,7 +370,7 @@ class Manager:
         validate_owner(owner)
         wt = Path(worktree).expanduser().resolve()
         if not wt.is_dir():
-            raise ValueError(f"worktree không tồn tại: {wt}")
+            raise ValueError(f"worktree does not exist: {wt}")
         packet = TaskPacket.model_validate_json(task)
         self._assert_no_overlap(wt, packet)
 
@@ -315,17 +384,37 @@ class Manager:
             str(wt),
             packet.id,
             backend=self.backend,
+            session_id=session.sdk_session_id,
             files=packet.files,
-            read_only=packet.is_read_only,
+            read_only=packet.read_only,
         )
         self._start(worker_id, task)
         return worker_id
 
     async def send(self, owner: str, worker_id: str, text: str) -> str:
+        """Send a message or a new task — works in every live worker state."""
         validate_owner(owner)
         row = self._require(worker_id, owner)
-        if row["state"] in {"RUNNING", "WAITING_ANSWER"}:
-            raise ValueError(f"{worker_id} đang {row['state']}; chờ report hoặc dùng answer")
+        state = row["state"]
+
+        if state == "WAITING_ANSWER":
+            pending = self.store.pending_questions(worker_id)
+            if pending:
+                # The orchestrator never has to remember the q-xxx id: `send` answers for it.
+                return await self.answer(owner, pending[0], text)
+
+        if state == "RUNNING":
+            session = self.sessions.get(worker_id)
+            if session is None:
+                raise ValueError(
+                    f"{worker_id} is RUNNING but the Manager holds no session "
+                    "(restarted?); use spawn_worker for a new task"
+                )
+            session.inbox.append(text)
+            return "queued (delivered to the worker right after the current turn)"
+
+        if state == "KILLED":
+            raise ValueError(f"{worker_id} was killed; use spawn_worker for a new task")
 
         try:
             packet: TaskPacket | None = TaskPacket.model_validate_json(text)
@@ -335,11 +424,10 @@ class Manager:
         session = self._session_for(worker_id)
         if packet is not None:
             self._assert_no_overlap(Path(row["worktree"]), packet)
-            session.task_id = packet.id
-            session._needs_approval = list(packet.needs_approval)  # noqa: SLF001
-            session._read_only = packet.is_read_only  # noqa: SLF001
-            self.store.set_task(worker_id, packet.id)
-            self.store.set_files(worker_id, packet.files)
+            session.apply_packet(packet)
+            self.store.set_task(
+                worker_id, packet.id, files=packet.files, read_only=packet.read_only
+            )
 
         self._start(worker_id, text)
         return "ok"
@@ -349,7 +437,7 @@ class Manager:
         qid = question_id[2:] if question_id.startswith("q-") else question_id
         row = self.store.question(qid)
         if row is None:
-            raise ValueError(f"không có câu hỏi {question_id}")
+            raise ValueError(f"no such question: {question_id}")
         self._require(row["worker"], owner)
         self.store.answer_question(qid, text)
 
@@ -383,10 +471,19 @@ class Manager:
         self.store.set_files(worker_id, [])
         return "ok"
 
-    def status(self, owner: str | None = None, project: str | None = None) -> list[dict[str, Any]]:
+    def status(
+        self,
+        owner: str | None = None,
+        project: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Worker list with progress. `FAILED`/`KILLED` rows are hidden by default."""
         rows = self.store.list_workers(owner=owner, project=project)
-        out = []
+        out: list[dict[str, Any]] = []
         for row in rows:
+            if not include_all and row["state"] in {"FAILED", "KILLED"}:
+                continue
+            session = self.sessions.get(row["id"])
             out.append(
                 {
                     "worker_id": row["id"],
@@ -398,7 +495,13 @@ class Manager:
                     "backend": row.get("backend"),
                     "session_id": row.get("session_id"),
                     "files": json.loads(row.get("files_json") or "[]"),
-                    # BUG-04: đọc từ SQLite, không lọc theo future trong RAM.
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                    # Progress comes from the live session; costs no tokens.
+                    "steps": session.steps if session else 0,
+                    "last_tool": session.last_tool if session else None,
+                    "last_activity": session.last_activity if session else None,
+                    # BUG-04: read from SQLite, not from in-RAM futures.
                     "pending_questions": self.store.pending_questions(row["id"]),
                 }
             )
@@ -419,7 +522,12 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
 
     @mcp.tool()
     async def send(owner: str, worker_id: str, text: str) -> str:
-        """Send a follow-up message or a new TaskPacket into the same conversation."""
+        """Send a message or a new TaskPacket to a worker.
+
+        Works in every live state: `IDLE` starts a new turn, `RUNNING` queues the
+        text for right after the current turn, `WAITING_ANSWER` answers the
+        pending ask_orchestrator question.
+        """
         return await manager.send(owner, worker_id, text)
 
     @mcp.tool()
@@ -428,9 +536,13 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
         return await manager.answer(owner, question_id, text)
 
     @mcp.tool()
-    async def status(owner: str | None = None, project: str | None = None) -> list[dict[str, Any]]:
-        """List workers: state, backend, current task, pending questions."""
-        return manager.status(owner=owner, project=project)
+    async def status(
+        owner: str | None = None,
+        project: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List workers: state, progress, backend, current task, pending questions."""
+        return manager.status(owner=owner, project=project, include_all=include_all)
 
     @mcp.tool()
     async def kill(owner: str, worker_id: str) -> str:
@@ -439,7 +551,7 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
 
     @mcp.tool()
     async def message_session(target: str, text: str) -> str:
-        """Send a message directly into a peer Claude Code session by name, PID, or session ID."""
+        """Send a message directly into a peer Claude Code session by exact name, PID, or session ID."""
         ok, err = await async_send_session_message(target, text)
         if ok:
             return f"sent to {target}"
@@ -449,7 +561,10 @@ def build_app(manager: Manager, host: str = DEFAULT_HOST, port: int = DEFAULT_PO
     async def api_status(request: Request) -> JSONResponse:
         owner = request.query_params.get("owner") or None
         project = request.query_params.get("project") or None
-        return JSONResponse(manager.status(owner=owner, project=project))
+        include_all = request.query_params.get("include_all", "").lower() in {"1", "true", "yes"}
+        return JSONResponse(
+            manager.status(owner=owner, project=project, include_all=include_all)
+        )
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> PlainTextResponse:

@@ -4,6 +4,6 @@ One machine-wide MCP server plus skills, packaged as a Claude Code plugin.
 See README.md for the three surfaces (plugin, CLI, MCP server).
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
-PROTOCOL_VERSION = "0.5"
+PROTOCOL_VERSION = "0.6"

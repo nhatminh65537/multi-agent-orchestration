@@ -1,4 +1,4 @@
-"""SQLite state for the Worker Manager (`coord.db`, Protocol v0.5).
+"""SQLite state for the Worker Manager (`coord.db`, Protocol v0.6).
 
 Lives in `COORD_HOME` (default `~/.local/share/coord/coord.db`) so one server on
 a machine can serve every project. Project-local artefacts (`.coord/logs/`,
@@ -7,10 +7,11 @@ a machine can serve every project. Project-local artefacts (`.coord/logs/`,
 Schema notes:
 
 * `session_id` is the opaque SDK session/conversation id — the basis of V-8/V-13.
-* `messages_json` is unused by the SDK drivers (they persist `session_id`); it stays
-  for a custom `session_factory` that keeps its own transcript.
 * `files_json` backs the overlap check (ADR-019).
-* `events` makes the event stream durable and replayable (ADR-017).
+* `events` is the durable audit/notification stream (ADR-017).
+
+Rows written by older versions may still carry the removed `parent` /
+`messages_json` columns or a `reports` table; they are simply ignored.
 """
 
 from __future__ import annotations
@@ -23,20 +24,18 @@ from typing import Any, Sequence
 
 SCHEMA = """
 create table if not exists workers (
-    id            text primary key,
-    owner         text not null,
-    project       text not null,
-    worktree      text not null,
-    task_id       text,
-    state         text not null,
-    parent        text,
-    backend       text not null default 'agy-sdk',
-    session_id    text,
-    files_json    text not null default '[]',
-    messages_json text,
-    read_only     integer not null default 0,
-    created_at    text not null,
-    updated_at    text not null
+    id         text primary key,
+    owner      text not null,
+    project    text not null,
+    worktree   text not null,
+    task_id    text,
+    state      text not null,
+    backend    text not null default 'agy-sdk',
+    session_id text,
+    files_json text not null default '[]',
+    read_only  integer not null default 0,
+    created_at text not null,
+    updated_at text not null
 );
 create table if not exists questions (
     id         text primary key,
@@ -45,14 +44,6 @@ create table if not exists questions (
     question   text not null,
     answer     text,
     answered   integer not null default 0,
-    created_at text not null
-);
-create table if not exists reports (
-    id         integer primary key autoincrement,
-    worker     text not null,
-    task_id    text,
-    status     text not null,
-    payload    text not null,
     created_at text not null
 );
 create table if not exists events (
@@ -67,12 +58,11 @@ create index if not exists workers_worktree on workers(worktree);
 create index if not exists events_owner on events(owner);
 """
 
-# Columns added in v0.4; older databases are migrated in place.
+# Columns added after v0.4; older databases are migrated in place.
 _ADDED_COLUMNS = {
     "backend": "text not null default 'agy-sdk'",
     "session_id": "text",
     "files_json": "text not null default '[]'",
-    "messages_json": "text",
     "read_only": "integer not null default 0",
 }
 
@@ -107,7 +97,6 @@ class Store:
         project: str,
         worktree: str,
         task_id: str | None,
-        parent: str | None = None,
         state: str = "RUNNING",
         *,
         backend: str = "agy-sdk",
@@ -117,9 +106,9 @@ class Store:
     ) -> None:
         ts = now()
         self.db.execute(
-            "insert into workers(id, owner, project, worktree, task_id, state, parent, backend,"
+            "insert into workers(id, owner, project, worktree, task_id, state, backend,"
             " session_id, files_json, read_only, created_at, updated_at)"
-            " values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " values(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 worker_id,
                 owner,
@@ -127,7 +116,6 @@ class Store:
                 worktree,
                 task_id,
                 state,
-                parent,
                 backend,
                 session_id,
                 json.dumps(list(files), ensure_ascii=False),
@@ -148,10 +136,26 @@ class Store:
         )
         self.db.commit()
 
-    def set_task(self, worker_id: str, task_id: str) -> None:
-        self.db.execute(
-            "update workers set task_id=?, updated_at=? where id=?", (task_id, now(), worker_id)
-        )
+    def set_task(
+        self,
+        worker_id: str,
+        task_id: str,
+        *,
+        files: Sequence[str] | None = None,
+        read_only: bool | None = None,
+    ) -> None:
+        """Bind a new TaskPacket: id, plus its `files`/`read_only` when given."""
+        sql = "update workers set task_id=?, updated_at=?"
+        params: list[Any] = [task_id, now()]
+        if files is not None:
+            sql += ", files_json=?"
+            params.append(json.dumps(list(files), ensure_ascii=False))
+        if read_only is not None:
+            sql += ", read_only=?"
+            params.append(int(read_only))
+        sql += " where id=?"
+        params.append(worker_id)
+        self.db.execute(sql, params)
         self.db.commit()
 
     def set_session(self, worker_id: str, session_id: str | None) -> None:
@@ -160,25 +164,6 @@ class Store:
             (session_id, now(), worker_id),
         )
         self.db.commit()
-
-    def set_messages(self, worker_id: str, messages: list[dict[str, Any]] | None) -> None:
-        payload = json.dumps(messages, ensure_ascii=False) if messages is not None else None
-        self.db.execute(
-            "update workers set messages_json=?, updated_at=? where id=?",
-            (payload, now(), worker_id),
-        )
-        self.db.commit()
-
-    def messages(self, worker_id: str) -> list[dict[str, Any]] | None:
-        row = self.db.execute(
-            "select messages_json from workers where id=?", (worker_id,)
-        ).fetchone()
-        if not row or not row["messages_json"]:
-            return None
-        try:
-            return json.loads(row["messages_json"])
-        except json.JSONDecodeError:
-            return None
 
     def set_files(self, worker_id: str, files: Sequence[str]) -> None:
         self.db.execute(
@@ -249,55 +234,14 @@ class Store:
         rows = self.db.execute("select * from questions where answered=0").fetchall()
         return [dict(r) for r in rows]
 
-    # ---------------------------------------------------------------- reports
-    def add_report(
-        self, worker: str, task_id: str | None, status: str, payload: dict[str, Any]
-    ) -> None:
-        self.db.execute(
-            "insert into reports(worker, task_id, status, payload, created_at) values(?,?,?,?,?)",
-            (worker, task_id, status, json.dumps(payload, ensure_ascii=False), now()),
-        )
-        self.db.commit()
-
-    def reports(self, worker: str | None = None) -> list[dict[str, Any]]:
-        if worker:
-            rows = self.db.execute(
-                "select * from reports where worker=? order by id", (worker,)
-            ).fetchall()
-        else:
-            rows = self.db.execute("select * from reports order by id").fetchall()
-        return [dict(r) for r in rows]
-
     # ----------------------------------------------------------------- events
-    def add_event(self, owner: str, line: str, **kwargs: Any) -> int:
+    def add_event(self, owner: str, line: str) -> int:
         cursor = self.db.execute(
             "insert into events(owner, line, created_at) values(?,?,?)",
             (owner, line, now()),
         )
         self.db.commit()
         return int(cursor.lastrowid)
-
-    def events(self, owner: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        """Lấy danh sách audit events gần nhất."""
-        if owner:
-            rows = self.db.execute(
-                "select * from events where owner=? order by id desc limit ?",
-                (owner, limit),
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                "select * from events order by id desc limit ?", (limit,)
-            ).fetchall()
-        return [dict(r) for r in reversed(rows)]
-
-    def prune_events(self, days: int = 7) -> int:
-        """Dọn dẹp audit events cũ hơn N ngày."""
-        cursor = self.db.execute(
-            "delete from events where datetime(created_at) < datetime('now', ?)",
-            (f"-{int(days)} day",),
-        )
-        self.db.commit()
-        return cursor.rowcount or 0
 
     def close(self) -> None:
         self.db.close()

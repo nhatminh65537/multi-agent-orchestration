@@ -1,6 +1,6 @@
 # Coordination state
 
-Chỉ **integrator** ghi file này. Mỗi stream một dòng.
+Only the **integrator** writes this file. One row per stream.
 
 | stream | owner | current task | status | last sha | note |
 |--------|-------|--------------|--------|----------|------|
@@ -8,5 +8,5 @@ Chỉ **integrator** ghi file này. Mỗi stream một dòng.
 | stream-B | B | — | idle | — | |
 | stream-C | C | — | idle | — | |
 
-Trạng thái hợp lệ: `active` / `waiting` / `idle` / `blocked`.
-Integrator tự theo dõi các task đang chờ nhau (ghi vào cột `note`).
+Valid statuses: `active` / `waiting` / `idle` / `blocked`.
+The integrator tracks tasks that wait on each other (record them in the `note` column).

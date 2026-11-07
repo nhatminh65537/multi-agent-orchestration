@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""V-8: restart giữ `IDLE` worker dùng lại được và dọn sạch phần còn treo.
+"""V-8: a restart keeps `IDLE` workers reusable and cleans up the dangling state.
 
     uv run python verify/v8_restore.py
 
-Không cần API key, không cần network: kiểm tra đường khôi phục bằng backend giả.
+No API key, no network: the restore path is exercised through a stub backend.
 """
 
 from __future__ import annotations
@@ -17,17 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from coord.backend import WorkerSession  # noqa: E402
 from coord.manager import Manager  # noqa: E402
-from coord.models import WorkerReport  # noqa: E402
 from coord.store import Store  # noqa: E402
 
 
 class _Stub(WorkerSession):
-    """Chỉ để `_session_for` dựng lại session; không chạy lượt nào."""
+    """Only used so `_session_for` can rebuild a session; it never runs a turn."""
 
     backend_name = "stub"
 
-    async def run(self, text: str) -> None:  # pragma: no cover - không dùng
-        raise AssertionError("stub session không chạy")
+    async def _run_turn(self, text: str, model: str) -> str:  # pragma: no cover - unused
+        raise AssertionError("stub session does not run")
 
 
 def stub_factory(
@@ -38,8 +37,8 @@ def stub_factory(
     worktree: Path,
     model: str,
     packet: Any,
-    ask: Callable[[str, str], Awaitable[str]],
-    on_report: Callable[[WorkerReport], Awaitable[None]],
+    ask: Callable[[str], Awaitable[str]],
+    notify: Callable[[str], None] | None = None,
     session_id: str | None = None,
 ) -> WorkerSession:
     return _Stub(
@@ -49,7 +48,7 @@ def stub_factory(
         model=model,
         packet=packet,
         ask=ask,
-        on_report=on_report,
+        notify=notify,
         session_id=session_id,
     )
 
@@ -68,27 +67,27 @@ def main() -> int:
         store.add_worker("A-run", "A", str(root), str(wt), "A-02", backend="agy-sdk")
         store.add_worker("A-wait", "A", str(root), str(wt), "A-03", backend="agy-sdk")
         store.set_state("A-wait", "WAITING_ANSWER")
-        store.add_question("q1", "A-wait", "A-03", "JWT hay cookie?")
+        store.add_question("q1", "A-wait", "A-03", "JWT or cookie?")
 
         Manager(store, backend="agy-sdk", session_factory=stub_factory, restore=False)
-        # tiến trình "chết" ở đây: không còn session nào trong RAM
+        # the process "dies" here: no session left in RAM
 
         second = Manager(store, backend="agy-sdk", session_factory=stub_factory, restore=True)
 
         checks = {
-            "IDLE giữ nguyên": store.worker("A-idle")["state"] == "IDLE",
+            "IDLE stays IDLE": store.worker("A-idle")["state"] == "IDLE",
             "RUNNING -> FAILED": store.worker("A-run")["state"] == "FAILED",
             "WAITING_ANSWER -> FAILED": store.worker("A-wait")["state"] == "FAILED",
-            "câu hỏi treo -> SERVER_RESTARTED": store.question("q1")["answer"]
+            "dangling question -> SERVER_RESTARTED": store.question("q1")["answer"]
             == "SERVER_RESTARTED",
-            "status không còn pending": all(
+            "status has no pending questions": all(
                 not row["pending_questions"] for row in second.status(owner="A")
             ),
         }
 
-        session = second._session_for("A-idle")  # noqa: SLF001 - chính là hành vi cần kiểm
-        checks["IDLE dựng lại được session"] = session.sdk_session_id == "sess-1"
-        checks["session gắn đúng worker"] = session.worker_id == "A-idle"
+        session = second._session_for("A-idle")  # noqa: SLF001 - exactly the behaviour under test
+        checks["IDLE worker rebuilds its session"] = session.sdk_session_id == "sess-1"
+        checks["session is bound to the worker"] = session.worker_id == "A-idle"
 
         width = max(len(label) for label in checks)
         for label, ok in checks.items():

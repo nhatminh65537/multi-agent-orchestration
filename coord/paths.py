@@ -42,11 +42,3 @@ def coord_home() -> Path:
         return Path(override)
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "coord"
 
-
-def env(*names: str, default: str | None = None) -> str | None:
-    """First non-empty environment variable among `names`."""
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return default

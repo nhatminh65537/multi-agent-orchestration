@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coord"
-version = "0.5.0"
+version = "0.6.0"
 description = "Worker Manager MCP server + Claude Code plugin for peer-group agent orchestration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,10 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Backend mặc định: Gemini / Vertex qua Antigravity runtime.
+# Default backend: Gemini / Vertex through the Antigravity runtime.
 agy = ["google-antigravity>=0.1.23,<0.2"]
-# Tuỳ chọn: full Claude Code harness (Read/Edit/Write/Bash/Glob/Grep,
-# project skills, project MCP, can_use_tool policy hook, resume).
+# Optional: the full Claude Code harness (Read/Edit/Write/Bash/Glob/Grep,
+# project skills, project MCP servers, can_use_tool policy hook, resume).
 claude = ["claude-agent-sdk>=0.2,<0.3"]
 both = ["claude-agent-sdk>=0.2,<0.3", "google-antigravity>=0.1.23,<0.2"]
 

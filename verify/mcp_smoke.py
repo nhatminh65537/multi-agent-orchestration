@@ -31,7 +31,7 @@ async def main(url: str) -> int:
             tools = {tool.name for tool in (await session.list_tools()).tools}
             print(f"tools ({len(tools)}): {', '.join(sorted(tools))}")
             if not EXPECTED <= tools:
-                print(f"FAIL thiếu tool: {sorted(EXPECTED - tools)}")
+                print(f"FAIL missing tools: {sorted(EXPECTED - tools)}")
                 return 1
 
             status = await session.call_tool("status", {})
@@ -43,12 +43,12 @@ async def main(url: str) -> int:
                 {"owner": "A", "worktree": "/tmp/coord-missing", "task": "{}"},
             )
             if not result.isError:
-                print("FAIL spawn_worker với worktree không tồn tại lại không lỗi")
+                print("FAIL spawn_worker accepted a worktree that does not exist")
                 return 1
             detail = result.content[0].text if result.content else ""
-            print(f"spawn_worker lỗi đúng như mong đợi: {detail[:140]}")
+            print(f"spawn_worker failed as expected: {detail[:140]}")
 
-    print("PASS V-11 (MCP streamable-http, 5 tool, lỗi protocol trả về client)")
+    print("PASS V-11 (MCP streamable-http, 5 tools, protocol errors returned to the client)")
     return 0
 
 

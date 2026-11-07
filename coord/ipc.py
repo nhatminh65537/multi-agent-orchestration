@@ -130,7 +130,12 @@ def load_records() -> list[dict[str, Any]]:
 
 
 def resolve_target(arg: str) -> str | None:
-    """Resolve an endpoint, session name, session ID, or PID to a messaging socket path."""
+    """Resolve an explicit endpoint, PID, session name, or session ID.
+
+    Name matching is **exact** (case-insensitive) on purpose: the old substring
+    fallback sent stream A's messages to any session whose name merely contained
+    "a" (e.g. "chat", "main").
+    """
     a = arg.strip()
     if not a:
         return None
@@ -153,7 +158,7 @@ def resolve_target(arg: str) -> str | None:
                 return r.get("messagingSocketPath")
         return None
 
-    # Session name or session id match
+    # Exact session name, or session id (exact or unambiguous prefix)
     low = a.lower()
     hits = [
         r
@@ -162,18 +167,15 @@ def resolve_target(arg: str) -> str | None:
         or str(r.get("sessionId", "")).lower() == low
         or str(r.get("sessionId", "")).lower().startswith(low)
     ]
-    if not hits:
-        hits = [r for r in recs if low in str(r.get("name", "")).lower()]
 
     if len(hits) == 1:
         return hits[0].get("messagingSocketPath")
     if len(hits) > 1:
-        # Prefer exact match if possible
         exact = [r for r in hits if str(r.get("name", "")).lower() == low]
         if len(exact) == 1:
             return exact[0].get("messagingSocketPath")
-        logger.warning("Ambiguous Claude session name %r; %d candidates found", a, len(hits))
-        return hits[0].get("messagingSocketPath")
+        logger.warning("Ambiguous Claude session %r; %d candidates found", a, len(hits))
+        return None
     return None
 
 

@@ -20,9 +20,9 @@ class TestConfig(unittest.TestCase):
         env_file.write_text(
             """
 # comment line
-COORD_API_KEY=test-key-123
-COORD_MODEL="gemini-2.5-pro"
-COORD_BACKEND='claude-sdk'
+WORKER_API_KEY=test-key-123
+WORKER_MODEL="gemini-2.5-pro"
+WORKER_BACKEND='claude-sdk'
 EMPTY_VAL=
             """,
             encoding="utf-8",
@@ -31,18 +31,18 @@ EMPTY_VAL=
         with patch.dict(os.environ, {}, clear=True):
             loaded = load_env_file(env_file)
             self.assertEqual(loaded, env_file)
-            self.assertEqual(os.environ.get("COORD_API_KEY"), "test-key-123")
-            self.assertEqual(os.environ.get("COORD_MODEL"), "gemini-2.5-pro")
-            self.assertEqual(os.environ.get("COORD_BACKEND"), "claude-sdk")
+            self.assertEqual(os.environ.get("WORKER_API_KEY"), "test-key-123")
+            self.assertEqual(os.environ.get("WORKER_MODEL"), "gemini-2.5-pro")
+            self.assertEqual(os.environ.get("WORKER_BACKEND"), "claude-sdk")
             self.assertIsNone(os.environ.get("EMPTY_VAL"))
 
     def test_does_not_override_existing_env(self) -> None:
         env_file = self.dir / ".env"
-        env_file.write_text("COORD_MODEL=gemini-2.5-flash\n", encoding="utf-8")
+        env_file.write_text("WORKER_MODEL=gemini-2.5-flash\n", encoding="utf-8")
 
-        with patch.dict(os.environ, {"COORD_MODEL": "user-override-model"}, clear=True):
+        with patch.dict(os.environ, {"WORKER_MODEL": "user-override-model"}, clear=True):
             load_env_file(env_file)
-            self.assertEqual(os.environ.get("COORD_MODEL"), "user-override-model")
+            self.assertEqual(os.environ.get("WORKER_MODEL"), "user-override-model")
 
     def test_missing_explicit_file_raises(self) -> None:
         with self.assertRaises(FileNotFoundError):

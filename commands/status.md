@@ -1,17 +1,21 @@
 ---
-description: Xem worker của bạn (hoặc toàn bộ) và các câu hỏi đang chờ
-argument-hint: [--owner A] [--project /path/to/repo]
+description: Show your workers (or all workers) and the questions waiting for an answer
+argument-hint: [--owner A] [--project /path/to/repo] [--all]
 allowed-tools: Bash(coord:*)
 ---
 
-Chạy `coord status $ARGUMENTS`.
+Run `coord status $ARGUMENTS`.
 
-Diễn giải kết quả:
+How to read the result:
 
-- `RUNNING` — đang chạy; đừng `send` thêm.
-- `IDLE` — có thể `send` task mới (giữ nguyên context).
-- `WAITING_ANSWER` — có câu hỏi trong cột `asks`; trả lời bằng `answer`, hoặc báo owner nếu đã cũ.
-- `FAILED` — xem `log=` trong event `FAILED` gần nhất; quyết định `send` sửa hay `spawn` lại.
-- `KILLED` — đã dừng; `spawn_worker` mới nếu cần.
+- `RUNNING` — working; do not `send` anything else and do not `kill` it. A quota retry also shows as
+  `RUNNING` (the worker reports "Waiting Ns before retry" in its event stream).
+- `IDLE` — a warm worker; `send` a new task to keep its context.
+- `WAITING_ANSWER` — there is a question in the `asks` column; answer it with `answer`, or with
+  `send` (which answers the pending question), or escalate to the owner if it is stale.
+- `FAILED` — read the `log=` path of the last `FAILED` event; decide between `send` (fix and retry)
+  and `spawn_worker` (fresh context). A `FAILED` carrying `429` / `RESOURCE_EXHAUSTED` / `503` is a
+  quota/infrastructure problem, not a code problem.
+- `KILLED` — stopped; `spawn_worker` if the work is still needed.
 
-Không đề xuất đọc log trừ khi người dùng hỏi chi tiết.
+Do not paste log contents unless the user asks for details.

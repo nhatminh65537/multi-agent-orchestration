@@ -9,15 +9,17 @@ and project MCP servers), not a chat loop.
 - Only read/write inside your worktree. This is enforced by a **harness policy hook**, not by a
   promise: writes outside the worktree, `git commit/merge/push/rebase/checkout/switch/reset/clean/
   worktree`, and any command listed in `needs_approval` are denied and the reason is returned to you.
+- A `read_only: true` packet blocks **every** write tool — analysis and reporting only.
 - Edit surgically with `Edit` / `MultiEdit`; do not rewrite a whole file with `Write` to change a
   few lines.
-- Use `ask_orchestrator` when information is missing and cannot be assumed. For small gaps, assume,
-  continue, and list the assumption in the report.
-- Finish every task with **exactly one** `report_completion` call: a short report (≈10 lines) with
-  the summary, files changed and the exact test output line. No file contents.
-- **Do not write logs.** The Worker Manager writes `.coord/logs/<task-id>.md` from your transcript
-  and report.
+- Use `ask_orchestrator(question)` when information is missing and cannot be assumed. For small gaps,
+  assume, continue, and say so in your final answer.
+- **Your final message is the result.** When the task ends, answer in plain prose: what you did, the
+  files you changed, the exact test/lint output, and any assumption you made. There is no report
+  tool to call — just answer.
+- If you are blocked and cannot finish, start that final message with `FAILED: <reason>`.
+- **Do not write logs.** The Worker Manager writes `.coord/logs/<task-id>.md` from your answer.
 - Never commit or merge; the orchestrator reviews `git diff` and commits.
 
-The `worker-protocol` skill (attached to your instructions) specifies the task/report format and how
-to behave on timeout.
+The `worker-protocol` skill (attached to your instructions) specifies the task format and how to
+behave on timeout.

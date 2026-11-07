@@ -114,6 +114,7 @@ class TestManagerIPCDispatch(unittest.TestCase):
         self.manager = Manager(self.store, backend="test")
 
     def tearDown(self) -> None:
+        self.store.close()
         self.tmp.cleanup()
 
     def test_emit_dispatches_ipc_notification(self) -> None:
