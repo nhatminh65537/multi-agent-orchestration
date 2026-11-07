@@ -1,7 +1,7 @@
 {
   "name": "coord",
   "description": "Worker Manager MCP server + orchestrator/integrator skills for peer-group agent orchestration.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Kitsu-kun"
   },
